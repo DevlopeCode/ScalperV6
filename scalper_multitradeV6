@@ -1,0 +1,924 @@
+//+------------------------------------------------------------------+
+//|                                  XAUUSD_PyramidScalper_v4.mq5    |
+//|                                                                  |
+//|  v4.03 - 6-LAYER PYRAMID, 5 POSITIONS PER LAYER, 24/7            |
+//|   * SL = 200 pips, TP = 500 pips (broker-side, shared TP).       |
+//|   * Up to 6 layers. Layer 2 opens at 20% of TP, then layers      |
+//|     3..6 at 35% / 50% / 65% / 80% of TP.                         |
+//|   * NEW: every layer opens InpPositionsPerLayer (default 5)      |
+//|     separate positions. The layer risk (InpLayerRiskPct) is      |
+//|     split equally between them.                                  |
+//|   * NEW: per-position breakeven rule. When a position has moved  |
+//|     more than InpBEMovePct (20%) of the TP distance in profit,   |
+//|     its SL is moved to its own breakeven (+ buffer).             |
+//|   * Staged trailing SL (% of TP from campaign entry):            |
+//|        30% TP -> SL 10% | 50% -> 35% | 80% -> 60%                |
+//|        90% TP -> SL 80% | 100% -> 90%                            |
+//|     The SL only ever moves FORWARD (never loosens).              |
+//|   * Before a new layer opens, all earlier positions are moved    |
+//|     to breakeven. New layers use the trailed SL if active.       |
+//|   * Each layer is sized on the ORIGINAL campaign SL.             |
+//|   * In fixed mode the % balance target and profit-lock are off.  |
+//|     Basket money stop and stop-and-reverse flips still work.     |
+//|   * Session filter REMOVED: the bot trades 24/7.                 |
+//+------------------------------------------------------------------+
+#property copyright "XAUUSD Pyramid Scalper"
+#property version   "4.03"
+#property description "Pyramiding scalper: 6 layers x 5 positions, fixed TP/SL, BE at 20% TP, staged trail, 24/7"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+enum ENUM_TARGET_MODE  { TGT_PCT_BALANCE, TGT_FIXED_CASH };
+enum ENUM_TREND_FILTER { TFILT_OFF=0, TFILT_ENTRY_ONLY=1, TFILT_STRICT=2 };
+
+//+------------------------------------------------------------------+
+input group "=== Fixed TP / SL + staged trailing ==="
+input bool   InpUseFixedTPSL     = true;      // true = fixed pip TP/SL (layered mode / hedging accounts)
+input double InpTPPips           = 500.0;     // take profit, pips (500 pips = $50.00 on 2-digit gold)
+input bool   InpSLEqualsTP       = false;     // true = SL pips = TP pips; false = use InpSLPips
+input double InpSLPips           = 200.0;     // SL pips (200 pips = $20.00) - used when InpSLEqualsTP = false
+input double InpLayer2TriggerPct = 20.0;      // fixed mode: open layer 2 when price is N% of TP in profit
+input double InpLayer3TriggerPct = 35.0;      // ... layer 3
+input double InpLayer4TriggerPct = 50.0;      // ... layer 4
+input double InpLayer5TriggerPct = 65.0;      // ... layer 5
+input double InpLayer6TriggerPct = 80.0;      // ... layer 6
+input double InpPointsPerPip     = 10.0;      // points per pip. Gold 2-digit: 10 => 1 pip = 0.10 price. Use 100 if you count 1 pip = 1.00
+input bool   InpUseStagedTrail   = true;      // staged trailing SL by % of TP (table in code: TRAIL_AT / TRAIL_TO)
+input bool   InpUseBEMove        = true;      // per-position breakeven rule
+input double InpBEMovePct        = 20.0;      // a position that is > N% of TP in profit gets its SL moved to breakeven
+
+input group "=== Direction engine (re-checked EVERY tick) ==="
+input ENUM_TIMEFRAMES   InpTF               = PERIOD_M1;   // bar TF: ATR, confirm-close, hold timer
+input ENUM_TIMEFRAMES   InpTrendTF          = PERIOD_M1;   // direction timeframe
+input int               InpTrendFast        = 5;           // fast EMA
+input int               InpTrendSlow        = 20;          // slow EMA
+input bool              InpUseFormingBar    = true;        // true = read EMAs on forming bar (intrabar flips)
+input double            InpFlipBandATR      = 0.05;        // hysteresis: EMA gap must pass N x ATR on the other side to flip
+input int               InpFlipConfirmMs    = 1500;        // new direction must persist N ms (0 = instant)
+input int               InpFlipConfirmTicks = 3;           // ... and at least N ticks
+input bool              InpMomentumConfirm  = true;        // flip only if price is on the new side of the fast EMA
+input ENUM_TREND_FILTER InpTrendFilter      = TFILT_OFF;   // EMA-trend filter: OFF / block counter-trend ENTRIES only / STRICT
+input int               InpEMATrend         = 200;         // trend-filter EMA period
+input double            InpEntrySepATR      = 0.10;        // fresh entries need EMA gap >= N x ATR (not applied to reversals)
+input bool              InpFlipOnReverse    = true;        // close basket when direction flips
+input bool              InpStopAndReverse   = true;        // ... and immediately open the opposite side
+input bool              InpIntrabarEntry    = true;        // look for entries on every tick
+input int               InpReentryCooldownSec = 3;         // wait after a NON-flip exit before re-entering
+input int               InpATRPeriod        = 14;
+
+input group "=== 6-Layer risk pyramid x positions per layer (hedging accounts) ==="
+input bool   InpUseLayeredRisk      = true;   // false = margin-ladder mode below
+input double InpTotalRiskPct        = 3.0;    // total planned loss for the campaign, % of balance (6 x 0.5%)
+input double InpLayerRiskPct        = 0.5;    // risk per LAYER, % of balance (split between its positions)
+input int    InpMaxLayers           = 6;      // 1..8
+input int    InpPositionsPerLayer   = 5;      // positions opened in EACH layer (1..10)
+input double InpInitialStopATR      = 1.0;    // layer-1 stop = N x ATR (used only when InpUseFixedTPSL=false)
+input double InpLayer2TriggerR      = 0.5;    // non-fixed mode only: R = initial stop distance
+input double InpLayer3TriggerR      = 1.0;
+input double InpLayer4TriggerR      = 1.5;    // layers 5+ extrapolate with the same step
+input bool   InpRequireConfirmClose = false;  // closed bar beyond trigger required (off = add on the tick)
+input double InpBreakevenBufferATR  = 0.05;   // BE = entry + N x ATR
+
+input group "=== Margin-ladder mode (InpUseLayeredRisk=false or netting) ==="
+input double InpMarginUsePct     = 30.0;      // max used margin, % of balance
+input double InpStepLot          = 0.01;
+input double InpMinLot           = 0.01;
+input double InpMaxTotalLots     = 0.0;       // absolute basket lot cap (0 = margin rule) - applies to both modes
+input int    InpMaxAddsHardCap   = 20;
+input bool   InpProgressiveLots  = true;      // 0.01 -> 0.02 -> 0.03 ...
+input double InpAddLotFactor     = 1.0;       // used when not progressive
+input double InpAddEveryATR      = 0.5;       // add after price advances N x ATR from last entry
+input bool   InpAddOnlyInProfit  = true;
+
+input group "=== Basket exit ==="
+input ENUM_TARGET_MODE InpTargetMode = TGT_PCT_BALANCE;
+input double InpTargetPct        = 4.5;       // ignored when InpUseFixedTPSL (TP does the job)
+input double InpTargetCash       = 2.0;
+input double InpBasketStopPct    = 3.0;       // money backstop (positions also carry broker SLs)
+input double InpTrailStartPct    = 1.5;       // profit-lock: ignored when InpUseFixedTPSL
+input double InpTrailLockPct     = 0.5;
+input int    InpMaxHoldBars      = 60;        // close a LOSING basket after N bars of InpTF (0 = off)
+
+input group "=== Safety ==="
+input bool   InpIgnoreViabilityCheck = true;
+input bool   InpVolAdaptiveStop  = true;
+input double InpHardRiskCapPct   = 15.0;
+input double InpMinSurvivalATR   = 2.0;
+input double InpMaxDailyLossPct  = 0.0;       // 0 = off
+input double InpDailyProfitLock  = 0.0;       // 0 = off
+input int    InpMaxBasketsPerDay = 0;         // 0 = unlimited
+input double InpMaxSpreadATR     = 0.0;       // 0 = off
+
+input group "=== Execution ==="
+input long   InpMagic            = 990099;
+input int    InpDeviationPoints  = 60;
+input bool   InpShowDashboard    = true;
+input int    InpFontSize         = 9;
+
+//+------------------------------------------------------------------+
+//| Staged trailing table (fractions of the TP distance from entry)  |
+//| When price has reached TRAIL_AT[i], SL is moved to TRAIL_TO[i].  |
+//| Edit here to change the strategy.                                |
+//+------------------------------------------------------------------+
+#define TRAIL_STAGES 5
+const double TRAIL_AT[TRAIL_STAGES] = {0.30,0.50,0.80,0.90,1.00};
+const double TRAIL_TO[TRAIL_STAGES] = {0.10,0.35,0.60,0.80,0.90};
+
+//+------------------------------------------------------------------+
+CTrade Trade; CPositionInfo Pos; CSymbolInfo Sym;
+int    hATR=INVALID_HANDLE,hTrF=INVALID_HANDLE,hTrS=INVALID_HANDLE,hTr200=INVALID_HANDLE;
+double atr=0,g_fast=0,g_slow=0,g_e200=0;
+
+// direction engine
+int  g_rawDir=0,g_confDir=0,g_pendDir=0,g_pendTicks=0,g_flips=0;
+long g_pendSinceMs=0;
+
+// basket
+int    g_dir=0,g_adds=0,g_barsHeld=0;
+double g_lastEntry=0,g_baseLot=0,g_peakBasket=0;
+bool   g_locked=false,g_blocked=false,g_layered=true;
+string g_note="starting";
+datetime g_day=0,g_lastBar=0,g_lastExitTime=0;
+double g_dayStartBalance=0,g_dayPnL=0; int g_dayBaskets=0; bool g_dayStopped=false;
+int    g_nBaskets=0,g_nWins=0,g_nLosses=0; double g_grossWin=0,g_grossLoss=0;
+
+// layers / positions
+#define MAX_LAYERS 8
+#define MAX_POS    80          // 8 layers x 10 positions
+ulong  g_pTicket[MAX_POS];
+double g_pEntry[MAX_POS],g_pSL[MAX_POS],g_pLots[MAX_POS];
+int    g_pLayer[MAX_POS];
+int    g_nPos=0;               // live tracked positions
+int    g_nLayers=0;            // layers opened in this campaign (never decreases)
+double g_campaignR=0,g_campaignSLPrice=0;
+
+// fixed TP / staged trail state
+double g_entry0=0;        // layer-1 entry price (reference for % of TP)
+double g_tpPrice=0;       // shared TP price for all positions (0 = none)
+double g_tpDist=0;        // TP distance in price units
+double g_trailSL=0;       // current trailed SL level (0 = not started)
+int    g_trailStage=-1;   // index into TRAIL_AT/TRAIL_TO
+
+//+------------------------------------------------------------------+
+//| Utilities                                                        |
+//+------------------------------------------------------------------+
+void     LG(string t,string m){ Print("[",t,"] ",m); }
+datetime DayStart(datetime t){ MqlDateTime d; TimeToStruct(t,d); d.hour=0; d.min=0; d.sec=0; return StructToTime(d); }
+double   Nrm(double p){ return NormalizeDouble(p,_Digits); }
+double   Buf(int h,int sh){ if(h==INVALID_HANDLE) return 0; double b[]; if(CopyBuffer(h,0,sh,1,b)!=1) return 0; return b[0]; }
+double   Bal(){ return AccountInfoDouble(ACCOUNT_BALANCE); }
+string   DirStr(int d){ return d>0?"BUY":(d<0?"SELL":"flat"); }
+double   PipDist(double pips){ return pips*InpPointsPerPip*_Point; }
+double   SLPips(){ return InpSLEqualsTP?InpTPPips:InpSLPips; }
+int      PosPerLayer(){ return (int)MathMax(1,MathMin(InpPositionsPerLayer,10)); }
+
+double MoneyPerLotPerPrice()
+  {
+   double tv=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE),ts=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   if(tv<=0||ts<=0) return 0;
+   return tv/ts;
+  }
+double MinLot(){ return MathMax(SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),InpMinLot); }
+double NormLot(double lots)
+  {
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+   double mx=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   lots=MathFloor(lots/step+1e-9)*step;
+   if(lots<MinLot()) lots=MinLot();
+   if(mx>0 && lots>mx) lots=mx;
+   return NormalizeDouble(lots,2);
+  }
+double StopsDist()
+  {
+   long lv=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL),fz=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
+   return (double)MathMax(lv,fz)*_Point+2*_Point;
+  }
+long NowMs(){ MqlTick t; if(SymbolInfoTick(_Symbol,t)) return (long)t.time_msc; return (long)TimeCurrent()*1000; }
+double Mid(){ Sym.RefreshRates(); return (Sym.Bid()+Sym.Ask())*0.5; }
+
+// widen an SL if it violates the broker's stops level
+double SafeSL(int dir,double sl)
+  {
+   Sym.RefreshRates(); double md=StopsDist();
+   if(dir>0){ double lim=Sym.Bid()-md; if(sl>lim) sl=lim; }
+   else     { double lim=Sym.Ask()+md; if(sl<lim) sl=lim; }
+   return Nrm(sl);
+  }
+bool MarginOK(int dir,double lots)
+  {
+   double m=0; Sym.RefreshRates();
+   double px=(dir>0)?Sym.Ask():Sym.Bid();
+   if(!OrderCalcMargin(dir>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL,_Symbol,lots,px,m)) return true;
+   return m<AccountInfoDouble(ACCOUNT_MARGIN_FREE)*0.95;
+  }
+
+//+------------------------------------------------------------------+
+//| Basket helpers                                                   |
+//+------------------------------------------------------------------+
+bool   Mine(){ return Pos.Symbol()==_Symbol && Pos.Magic()==InpMagic; }
+int    BasketCount(){ int n=0; for(int i=PositionsTotal()-1;i>=0;i--) if(Pos.SelectByIndex(i)&&Mine()) n++; return n; }
+double BasketLots() { double v=0; for(int i=PositionsTotal()-1;i>=0;i--) if(Pos.SelectByIndex(i)&&Mine()) v+=Pos.Volume(); return v; }
+double BasketProfit(){ double p=0; for(int i=PositionsTotal()-1;i>=0;i--) if(Pos.SelectByIndex(i)&&Mine()) p+=Pos.Profit()+Pos.Swap()+Pos.Commission(); return p; }
+int    BasketDir()  { for(int i=PositionsTotal()-1;i>=0;i--) if(Pos.SelectByIndex(i)&&Mine()) return (Pos.PositionType()==POSITION_TYPE_BUY)?1:-1; return 0; }
+
+void ResetCampaign()
+  {
+   g_dir=0; g_adds=0; g_lastEntry=0; g_barsHeld=0; g_peakBasket=0; g_locked=false;
+   g_nLayers=0; g_nPos=0; g_campaignR=0; g_campaignSLPrice=0;
+   g_entry0=0; g_tpPrice=0; g_tpDist=0; g_trailSL=0; g_trailStage=-1;
+  }
+
+void AddPos(ulong tk,double entry,double sl,double lots,int layer)
+  {
+   if(g_nPos>=MAX_POS) return;
+   g_pTicket[g_nPos]=tk; g_pEntry[g_nPos]=entry; g_pSL[g_nPos]=sl; g_pLots[g_nPos]=lots; g_pLayer[g_nPos]=layer;
+   g_nPos++;
+  }
+
+void CloseBasket(string why)
+  {
+   double pnl=BasketProfit();
+   for(int pass=0;pass<3;pass++)
+     {
+      bool any=false;
+      for(int i=PositionsTotal()-1;i>=0;i--)
+         if(Pos.SelectByIndex(i)&&Mine()){ Trade.PositionClose(Pos.Ticket(),InpDeviationPoints); any=true; }
+      if(!any) break;
+     }
+   if(BasketCount()==0)
+     {
+      g_dayPnL+=pnl; g_nBaskets++;
+      if(pnl>0){ g_nWins++; g_grossWin+=pnl; } else if(pnl<0){ g_nLosses++; g_grossLoss+=-pnl; }
+      LG("BASKET",StringFormat("closed (%s) pnl %.2f | day %+.2f",why,pnl,g_dayPnL));
+      ResetCampaign(); g_lastExitTime=TimeCurrent();
+     }
+   else LG("ERROR",StringFormat("close incomplete: %d position(s) still open",BasketCount()));
+  }
+
+//+------------------------------------------------------------------+
+//| Direction engine - called every tick                             |
+//+------------------------------------------------------------------+
+void UpdateDirection()
+  {
+   int sh=InpUseFormingBar?0:1;
+   double f=Buf(hTrF,sh),s=Buf(hTrS,sh);
+   if(f<=0||s<=0) return;
+   g_fast=f; g_slow=s;
+   g_e200=(hTr200!=INVALID_HANDLE)?Buf(hTr200,sh):0;
+
+   // hysteresis: inside the band the previous raw direction is kept
+   double band=InpFlipBandATR*atr,gap=f-s;
+   if(gap>band) g_rawDir=1; else if(gap<-band) g_rawDir=-1;
+
+   int cand=g_rawDir;
+   double mid=Mid();
+   if(InpMomentumConfirm && cand!=0 && cand!=g_confDir)
+      if((cand>0 && mid<=f)||(cand<0 && mid>=f)) cand=g_confDir;
+   if(InpTrendFilter==TFILT_STRICT && g_e200>0 && cand!=0)
+      if((cand>0 && mid<g_e200)||(cand<0 && mid>g_e200)) cand=0;
+
+   long now=NowMs();
+   if(cand==g_confDir){ g_pendDir=cand; g_pendTicks=0; g_pendSinceMs=now; return; }
+   if(cand!=g_pendDir){ g_pendDir=cand; g_pendTicks=1; g_pendSinceMs=now; }
+   else g_pendTicks++;
+
+   bool first=(g_confDir==0 && cand!=0);
+   if(first || ((now-g_pendSinceMs)>=InpFlipConfirmMs && g_pendTicks>=InpFlipConfirmTicks))
+     {
+      if(g_confDir!=0 && cand!=0) g_flips++;
+      LG("DIR",StringFormat("%s -> %s  (gap %.2f, band %.2f, %d ticks, %d ms)",DirStr(g_confDir),DirStr(cand),gap,band,g_pendTicks,(int)(now-g_pendSinceMs)));
+      g_confDir=cand; g_pendTicks=0;
+     }
+  }
+
+// direction allowed for a new campaign
+int EntryDirection(bool isReverse)
+  {
+   int d=g_confDir; if(d==0) return 0;
+   if(InpTrendFilter==TFILT_ENTRY_ONLY && g_e200>0)
+     { double mid=Mid(); if((d>0&&mid<g_e200)||(d<0&&mid>g_e200)){ g_note="entry blocked: against EMA"+IntegerToString(InpEMATrend); return 0; } }
+   if(!isReverse && InpEntrySepATR>0 && atr>0 && MathAbs(g_fast-g_slow)<InpEntrySepATR*atr){ g_note="EMAs too close for fresh entry"; return 0; }
+   return d;
+  }
+
+//+------------------------------------------------------------------+
+//| Order execution                                                  |
+//+------------------------------------------------------------------+
+bool SendMarket(int dir,double lots,double sl,double tp,double &fillPx,ulong &posTicket,string cmt)
+  {
+   fillPx=0; posTicket=0;
+   int fm=(int)SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING tries[3]={ORDER_FILLING_IOC,ORDER_FILLING_FOK,ORDER_FILLING_RETURN};
+   bool slDropped=false;
+   for(int a=0;a<3;a++)
+     {
+      if(tries[a]==ORDER_FILLING_IOC && (fm&SYMBOL_FILLING_IOC)==0) continue;
+      if(tries[a]==ORDER_FILLING_FOK && (fm&SYMBOL_FILLING_FOK)==0) continue;
+      Trade.SetTypeFilling(tries[a]);
+      Sym.RefreshRates();
+      double s=(sl>0)?Nrm(sl):0;
+      double t=(tp>0)?Nrm(tp):0;
+      bool ok=(dir>0)?Trade.Buy(lots,_Symbol,0,s,t,cmt):Trade.Sell(lots,_Symbol,0,s,t,cmt);
+      uint rc=Trade.ResultRetcode();
+      if(ok && (rc==TRADE_RETCODE_DONE||rc==TRADE_RETCODE_DONE_PARTIAL||rc==TRADE_RETCODE_PLACED))
+        {
+         fillPx=Trade.ResultPrice(); if(fillPx<=0) fillPx=(dir>0)?Sym.Ask():Sym.Bid();
+         ulong deal=Trade.ResultDeal();
+         if(deal>0 && HistoryDealSelect(deal)) posTicket=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+         if(posTicket==0) posTicket=Trade.ResultOrder();
+         return true;
+        }
+      LG("ERROR",StringFormat("send %s %.2f failed: %u %s",DirStr(dir),lots,rc,Trade.ResultRetcodeDescription()));
+      if(rc==TRADE_RETCODE_INVALID_STOPS && (sl>0||tp>0) && !slDropped){ sl=0; tp=0; slDropped=true; a--; continue; } // retry naked, SL/TP set after
+      if(rc!=TRADE_RETCODE_INVALID_FILL) return false;
+     }
+   return false;
+  }
+
+// make sure the position has an SL (and TP if wanted); returns the SL actually on the position (0 if none)
+double EnsureSL(ulong tk,int dir,double wantSL,double wantTP)
+  {
+   if(tk==0||!PositionSelectByTicket(tk)) return 0;
+   double cur=PositionGetDouble(POSITION_SL),ctp=PositionGetDouble(POSITION_TP);
+   if(cur>0 && (wantTP<=0||ctp>0)) return cur;
+   double s=(cur>0)?cur:SafeSL(dir,wantSL);
+   double t=(ctp>0)?ctp:((wantTP>0)?Nrm(wantTP):0);
+   if(Trade.PositionModify(tk,s,t)) return s;
+   LG("WARN",StringFormat("could not attach SL/TP to #%I64u: %s",tk,Trade.ResultRetcodeDescription()));
+   return cur;
+  }
+
+//+------------------------------------------------------------------+
+//| Ladder-mode sizing                                               |
+//+------------------------------------------------------------------+
+double MarginPerLot(){ double m=0; if(!OrderCalcMargin(ORDER_TYPE_BUY,_Symbol,1.0,SymbolInfoDouble(_Symbol,SYMBOL_ASK),m)) return 0; return m; }
+double BaseLot(){ return NormLot(InpStepLot>0?InpStepLot:MinLot()); }
+int LadderSteps()
+  {
+   double mpl=MarginPerLot(),b=BaseLot(); if(mpl<=0||b<=0) return 1;
+   int steps=(int)MathFloor((Bal()*InpMarginUsePct/100.0/mpl)/b);
+   return (int)MathMax(1,MathMin(steps,InpMaxAddsHardCap+1));
+  }
+int MaxAdds(){ return (InpMarginUsePct>0)?LadderSteps()-1:InpMaxAddsHardCap; }
+double MaxTotalLots()
+  {
+   if(InpMaxTotalLots>0) return InpMaxTotalLots;
+   if(InpMarginUsePct>0){ double mm=MarginPerLot(); if(mm>0) return (Bal()*InpMarginUsePct/100.0)/mm; }
+   return BaseLot()*(1+InpMaxAddsHardCap);
+  }
+double StopCash()
+  {
+   double bal=Bal(),cash=bal*InpBasketStopPct/100.0;
+   if(InpVolAdaptiveStop && atr>0)
+     { double need=BasketLots()*MoneyPerLotPerPrice()*InpMinSurvivalATR*atr; if(need>cash) cash=need; }
+   return MathMin(cash,bal*InpHardRiskCapPct/100.0);
+  }
+bool ViabilityCheck(string &why)
+  {
+   double mpl=MoneyPerLotPerPrice();
+   if(mpl<=0||atr<=0){ why="no tick/ATR data yet"; return false; }
+   double riskCash=MinLot()*mpl*InpMinSurvivalATR*atr;
+   double pct=(Bal()>0)?riskCash/Bal()*100.0:999.0;
+   if(pct>InpHardRiskCapPct)
+     { why=StringFormat("one %.2f lot risks %.1f%% over %.1f x ATR (cap %.1f%%). Min viable balance ~%.0f",MinLot(),pct,InpMinSurvivalATR,InpHardRiskCapPct,riskCash/(InpHardRiskCapPct/100.0)); return false; }
+   return true;
+  }
+
+bool OpenBase(int dir)
+  {
+   double lots=BaseLot(),cap=MaxTotalLots();
+   if(cap>0 && lots>cap) lots=NormLot(cap);
+   if(!MarginOK(dir,lots)){ g_note="not enough free margin"; return false; }
+   double fill; ulong tk;
+   if(!SendMarket(dir,lots,0,0,fill,tk,"pyr")) return false;
+   g_dir=dir; g_adds=0; g_lastEntry=fill; g_baseLot=lots; g_barsHeld=0; g_peakBasket=0; g_locked=false; g_dayBaskets++;
+   LG("OPEN",StringFormat("BASE %s %.2f @ %s (bal %.2f, cap %.2f lots)",DirStr(dir),lots,DoubleToString(fill,_Digits),Bal(),cap));
+   return true;
+  }
+
+void TryPyramid()
+  {
+   if(g_dir==0 || g_adds>=MaxAdds()) return;
+   if(InpAddOnlyInProfit && BasketProfit()<=0) return;
+   if(g_confDir!=g_dir) return;
+   Sym.RefreshRates();
+   double px=(g_dir>0)?Sym.Bid():Sym.Ask();
+   if(g_dir*(px-g_lastEntry)<InpAddEveryATR*atr) return;
+   double lots=InpProgressiveLots?InpStepLot*(g_adds+2):g_baseLot*MathPow(InpAddLotFactor,g_adds+1);
+   lots=NormLot(lots);
+   double cap=MaxTotalLots();
+   if(cap>0 && BasketLots()+lots>cap){ g_note=StringFormat("ladder full (%.2f/%.2f)",BasketLots(),cap); return; }
+   if(!MarginOK(g_dir,lots)){ g_note="not enough free margin to add"; return; }
+   double fill; ulong tk;
+   if(!SendMarket(g_dir,lots,0,0,fill,tk,"pyr")) return;
+   g_adds++; g_lastEntry=fill;
+   LG("PYRAMID",StringFormat("add #%d %.2f @ %s  basket %.2f lots",g_adds,lots,DoubleToString(fill,_Digits),BasketLots()));
+  }
+
+//+------------------------------------------------------------------+
+//| Layered risk pyramid                                             |
+//+------------------------------------------------------------------+
+// lots for ONE position: the layer risk is split equally between the positions of the layer
+double PosLots(double dist)
+  {
+   double mpl=MoneyPerLotPerPrice();
+   if(dist<=0||mpl<=0) return NormLot(MinLot());
+   return NormLot(Bal()*InpLayerRiskPct/100.0/PosPerLayer()/(dist*mpl));
+  }
+int NumLayersAllowed()
+  {
+   int n=(InpLayerRiskPct>0)?(int)MathFloor(InpTotalRiskPct/InpLayerRiskPct+1e-6):1;
+   return (int)MathMax(1,MathMin(n,MathMin(InpMaxLayers,MAX_LAYERS)));
+  }
+// fixed mode: % of TP distance at which the NEXT layer opens (nOpen = layers already open)
+double LayerTriggerPct(int nOpen)
+  {
+   if(nOpen<=1) return InpLayer2TriggerPct;   // 20%
+   if(nOpen==2) return InpLayer3TriggerPct;   // 35%
+   if(nOpen==3) return InpLayer4TriggerPct;   // 50%
+   if(nOpen==4) return InpLayer5TriggerPct;   // 65%
+   return InpLayer6TriggerPct;                // 80%
+  }
+double LayerTriggerR(int nOpen)
+  {
+   if(nOpen<=1) return InpLayer2TriggerR;
+   if(nOpen==2) return InpLayer3TriggerR;
+   return InpLayer4TriggerR+(nOpen-3)*(InpLayer4TriggerR-InpLayer3TriggerR);
+  }
+
+// drop tracked positions that no longer exist (closed by SL / TP / breakeven)
+void SyncLayers()
+  {
+   if(g_nPos==0) return;
+   int w=0;
+   for(int j=0;j<g_nPos;j++)
+      if(g_pTicket[j]>0 && PositionSelectByTicket(g_pTicket[j]))
+        {
+         if(w!=j){ g_pTicket[w]=g_pTicket[j]; g_pEntry[w]=g_pEntry[j]; g_pSL[w]=g_pSL[j]; g_pLots[w]=g_pLots[j]; g_pLayer[w]=g_pLayer[j]; }
+         w++;
+        }
+   if(w!=g_nPos)
+     {
+      LG("SYNC",StringFormat("%d position(s) closed by broker - %d remain",g_nPos-w,w));
+      g_nPos=w;
+      if(w==0 && BasketCount()==0){ ResetCampaign(); g_lastExitTime=TimeCurrent(); }
+     }
+  }
+
+// true only when EVERY open position is at breakeven or better (used as the gate before a new layer)
+bool ProtectEarlierLayers()
+  {
+   double buf=InpBreakevenBufferATR*atr,md=StopsDist();
+   Sym.RefreshRates();
+   bool all=true;
+   for(int j=0;j<g_nPos;j++)
+     {
+      double be=Nrm(g_pEntry[j]+g_dir*buf);
+      bool atBE=(g_pSL[j]>0) && ((g_dir>0)?(g_pSL[j]>=be-_Point):(g_pSL[j]<=be+_Point));
+      if(atBE) continue;
+      bool placeable=(g_dir>0)?(be<=Sym.Bid()-md):(be>=Sym.Ask()+md);
+      if(placeable && g_pTicket[j]>0 && Trade.PositionModify(g_pTicket[j],be,g_tpPrice))   // keep TP!
+        { g_pSL[j]=be; LG("PROTECT",StringFormat("layer %d pos #%I64u SL -> %s (BE+buf)",g_pLayer[j],g_pTicket[j],DoubleToString(be,_Digits))); }
+      else all=false;
+     }
+   return all;
+  }
+
+// PER-POSITION BREAKEVEN: a position that is > InpBEMovePct of the TP distance in profit gets SL = its own entry (+buffer)
+void ApplyBreakevenRule()
+  {
+   if(!InpUseBEMove || !InpUseFixedTPSL) return;
+   if(g_nPos==0 || g_dir==0 || g_tpDist<=0) return;
+   Sym.RefreshRates();
+   double px=(g_dir>0)?Sym.Bid():Sym.Ask();
+   double trig=InpBEMovePct/100.0*g_tpDist;
+   double buf=InpBreakevenBufferATR*atr,md=StopsDist();
+   for(int j=0;j<g_nPos;j++)
+     {
+      if(g_pTicket[j]==0) continue;
+      if(g_dir*(px-g_pEntry[j])<trig-1e-9) continue;               // not far enough in profit yet
+      double be=Nrm(g_pEntry[j]+g_dir*buf);
+      if(g_pSL[j]>0 && g_dir*(be-g_pSL[j])<=_Point) continue;      // SL already at / beyond breakeven
+      bool placeable=(g_dir>0)?(be<=Sym.Bid()-md):(be>=Sym.Ask()+md);
+      if(!placeable) continue;
+      if(Trade.PositionModify(g_pTicket[j],be,g_tpPrice))
+        { g_pSL[j]=be; LG("BE",StringFormat("layer %d pos #%I64u > %.0f%% TP in profit -> SL to breakeven %s",g_pLayer[j],g_pTicket[j],InpBEMovePct,DoubleToString(be,_Digits))); }
+     }
+  }
+
+// STAGED TRAILING: SL follows % of TP reached (see TRAIL_AT / TRAIL_TO). Only moves forward.
+void ApplyStagedTrail()
+  {
+   if(!InpUseFixedTPSL || !InpUseStagedTrail) return;
+   if(g_nPos==0 || g_dir==0 || g_tpDist<=0 || g_entry0<=0) return;
+   Sym.RefreshRates();
+   double px=(g_dir>0)?Sym.Bid():Sym.Ask();
+   double prog=g_dir*(px-g_entry0)/g_tpDist;          // 0.20 = 20% of TP reached
+
+   int st=-1;
+   for(int i=0;i<TRAIL_STAGES;i++) if(prog>=TRAIL_AT[i]-1e-9) st=i;
+
+   double md=StopsDist();
+   if(st>=0)
+     {
+      double lvl=Nrm(g_entry0+g_dir*TRAIL_TO[st]*g_tpDist);
+      bool ok=(g_dir>0)?(lvl<=Sym.Bid()-md):(lvl>=Sym.Ask()+md);
+      if(ok && (g_trailSL==0 || g_dir*(lvl-g_trailSL)>_Point))
+        {
+         g_trailSL=lvl; g_trailStage=st;
+         LG("TRAIL",StringFormat("crossed %.0f%% TP -> SL to %.0f%% TP = %s",TRAIL_AT[st]*100,TRAIL_TO[st]*100,DoubleToString(lvl,_Digits)));
+        }
+     }
+   if(g_trailSL<=0) return;
+
+   // push the trailed SL onto every position that is still behind it (also retries failed modifies)
+   for(int j=0;j<g_nPos;j++)
+     {
+      if(g_pTicket[j]==0) continue;
+      if(g_pSL[j]>0 && g_dir*(g_trailSL-g_pSL[j])<=_Point) continue;
+      bool placeable=(g_dir>0)?(g_trailSL<=Sym.Bid()-md):(g_trailSL>=Sym.Ask()+md);
+      if(!placeable) continue;
+      if(Trade.PositionModify(g_pTicket[j],g_trailSL,g_tpPrice)) g_pSL[j]=g_trailSL;
+     }
+  }
+
+bool OpenLayer1(int dir)
+  {
+   Sym.RefreshRates();
+   int N=PosPerLayer();
+   double spread=Sym.Ask()-Sym.Bid();
+   double baseDist=InpUseFixedTPSL?PipDist(SLPips()):InpInitialStopATR*atr;
+   double stopDist=MathMax(baseDist,StopsDist()+spread);
+   double tpDist=InpUseFixedTPSL?PipDist(InpTPPips):0;
+   double lots=PosLots(stopDist);
+   int n=N;
+   if(InpMaxTotalLots>0)
+     {
+      n=(int)MathMin(N,MathFloor(InpMaxTotalLots/lots+1e-9));
+      if(n<1){ g_note="lot cap too small for one position"; return false; }
+     }
+   if(!MarginOK(dir,lots*n)){ g_note="not enough free margin"; return false; }
+   double est=(dir>0)?Sym.Ask():Sym.Bid();
+   double tpPrice=(tpDist>0)?Nrm(est+dir*tpDist):0;
+
+   g_nPos=0;
+   int opened=0; double firstFill=0,firstSL=0;
+   for(int k=0;k<n;k++)
+     {
+      double fill; ulong tk;
+      if(!SendMarket(dir,lots,SafeSL(dir,est-dir*stopDist),tpPrice,fill,tk,"pyrL1")) break;
+      double sl=EnsureSL(tk,dir,fill-dir*stopDist,tpPrice);
+      if(sl<=0) sl=fill-dir*stopDist;
+      AddPos(tk,fill,sl,lots,1);
+      opened++;
+      if(opened==1){ firstFill=fill; firstSL=sl; }
+     }
+   if(opened==0) return false;
+
+   g_nLayers=1;
+   g_campaignR=MathAbs(firstFill-firstSL); g_campaignSLPrice=firstSL;
+   g_entry0=firstFill; g_tpPrice=tpPrice; g_tpDist=tpDist; g_trailSL=0; g_trailStage=-1;
+   g_dir=dir; g_adds=0; g_lastEntry=firstFill; g_baseLot=lots; g_barsHeld=0; g_peakBasket=0; g_locked=false; g_dayBaskets++;
+   double riskPct=(Bal()>0)?lots*opened*MoneyPerLotPerPrice()*g_campaignR/Bal()*100.0:0;
+   LG("LAYER1",StringFormat("%s %d x %.2f @ %s SL %s TP %s R=%s layer risk %.2f%% (plan %.2f%%, %d layers / %.1f%%)",
+        DirStr(dir),opened,lots,DoubleToString(firstFill,_Digits),DoubleToString(firstSL,_Digits),tpPrice>0?DoubleToString(tpPrice,_Digits):"-",
+        DoubleToString(g_campaignR,_Digits),riskPct,InpLayerRiskPct,NumLayersAllowed(),InpTotalRiskPct));
+   if(opened<N) LG("WARN",StringFormat("only %d of %d positions opened for layer 1",opened,N));
+   if(riskPct>InpLayerRiskPct*2) LG("WARN","min lot x positions forces layer risk above plan - balance is small for this SL distance");
+   return true;
+  }
+
+bool OpenLayer(int dir)
+  {
+   if(g_nLayers>=MAX_LAYERS) return false;
+   int N=PosPerLayer();
+   if(g_nPos+N>MAX_POS){ g_note="position array full"; return false; }
+   Sym.RefreshRates();
+   double spread=Sym.Ask()-Sym.Bid();
+   double entry=(dir>0)?Sym.Ask():Sym.Bid();
+   double riskDist=dir*(entry-g_campaignSLPrice);      // sized on the ORIGINAL campaign SL, so risk never exceeds plan
+   if(riskDist<StopsDist()+spread){ g_note="too close to campaign SL to add"; return false; }
+   if(g_tpPrice>0 && dir*(g_tpPrice-entry)<StopsDist()+spread){ g_note="too close to TP to add a layer"; return false; }
+   double lots=PosLots(riskDist);
+   int n=N;
+   if(InpMaxTotalLots>0)
+     {
+      double room=InpMaxTotalLots-BasketLots();
+      n=(int)MathMin(N,MathFloor(room/lots+1e-9));
+      if(n<1){ g_note="lot cap reached"; return false; }
+     }
+   if(!MarginOK(dir,lots*n)){ g_note="not enough free margin to add"; return false; }
+
+   // use the trailed SL for the new layer if it is already active and valid
+   double wantSL=g_campaignSLPrice,md=StopsDist();
+   if(g_trailSL>0 && dir*(g_trailSL-wantSL)>0)
+     {
+      bool okT=(dir>0)?(g_trailSL<=Sym.Bid()-md):(g_trailSL>=Sym.Ask()+md);
+      if(okT) wantSL=g_trailSL;
+     }
+   int layerNo=g_nLayers+1;
+   string cmt="pyrL"+IntegerToString(layerNo);
+   int opened=0; double firstFill=0,firstSL=0;
+   for(int k=0;k<n;k++)
+     {
+      double fill; ulong tk;
+      if(!SendMarket(dir,lots,SafeSL(dir,wantSL),g_tpPrice,fill,tk,cmt)) break;
+      double sl=EnsureSL(tk,dir,wantSL,g_tpPrice); if(sl<=0) sl=wantSL;
+      AddPos(tk,fill,sl,lots,layerNo);
+      opened++;
+      if(opened==1){ firstFill=fill; firstSL=sl; }
+     }
+   if(opened==0) return false;
+   g_nLayers=layerNo; g_adds=g_nLayers-1; g_lastEntry=firstFill;
+   LG("LAYER",StringFormat("#%d %s %d x %.2f @ %s SL %s TP %s basket %.2f lots",g_nLayers,DirStr(dir),opened,lots,DoubleToString(firstFill,_Digits),DoubleToString(firstSL,_Digits),
+        g_tpPrice>0?DoubleToString(g_tpPrice,_Digits):"-",BasketLots()));
+   if(opened<N) LG("WARN",StringFormat("only %d of %d positions opened for layer %d",opened,N,layerNo));
+   return true;
+  }
+
+void TryLayeredPyramid()
+  {
+   if(g_nLayers==0||g_dir==0) return;
+   if(g_nLayers>=NumLayersAllowed()){ g_note="all layers filled"; return; }
+   if(InpAddOnlyInProfit && BasketProfit()<=0) return;
+   double R=g_campaignR; if(R<=0) return;
+   Sym.RefreshRates();
+   double px=(g_dir>0)?Sym.Bid():Sym.Ask();
+   bool fx=(InpUseFixedTPSL && g_tpDist>0 && g_entry0>0);
+   double unit=fx?g_tpDist:R, basePx=g_entry0;
+   double need=fx?LayerTriggerPct(g_nLayers)/100.0:LayerTriggerR(g_nLayers);
+   double prog=g_dir*(px-basePx)/unit;
+   if(prog<need)
+     {
+      g_note=fx?StringFormat("layer %d needs %.0f%% of TP (at %.0f%%)",g_nLayers+1,need*100,prog*100)
+               :StringFormat("layer %d needs +%.2fR (at %.2fR)",g_nLayers+1,need,prog);
+      return;
+     }
+   if(InpRequireConfirmClose)
+     {
+      double trig=basePx+g_dir*need*unit, lc=iClose(_Symbol,InpTF,1);
+      if(!((g_dir>0)?(lc>=trig):(lc<=trig))){ g_note=StringFormat("layer %d: waiting for close past %s",g_nLayers+1,DoubleToString(trig,_Digits)); return; }
+     }
+   if(g_confDir!=g_dir){ g_note=StringFormat("layer %d: trend not confirming",g_nLayers+1); return; }
+   if(!ProtectEarlierLayers()){ g_note="waiting for earlier positions to reach breakeven"; return; }
+   OpenLayer(g_dir);
+  }
+
+//+------------------------------------------------------------------+
+//| Gates / entries / management                                     |
+//+------------------------------------------------------------------+
+bool Gates(string &why)
+  {
+   datetime now=TimeCurrent();
+   if(DayStart(now)!=g_day){ g_day=DayStart(now); g_dayStartBalance=Bal(); g_dayPnL=0; g_dayBaskets=0; g_dayStopped=false; }
+   if(g_dayStopped){ why="day stopped"; return false; }
+   if(InpMaxDailyLossPct>0 && g_dayStartBalance>0 && g_dayPnL<=-g_dayStartBalance*InpMaxDailyLossPct/100.0){ g_dayStopped=true; why="daily loss limit"; return false; }
+   if(InpDailyProfitLock>0 && g_dayPnL>=g_dayStartBalance*InpDailyProfitLock/100.0){ g_dayStopped=true; why="daily profit locked"; return false; }
+   if(InpMaxBasketsPerDay>0 && g_dayBaskets>=InpMaxBasketsPerDay){ why="max baskets today"; return false; }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)||!MQLInfoInteger(MQL_TRADE_ALLOWED)){ why="AutoTrading off"; return false; }
+   if(SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE)!=SYMBOL_TRADE_MODE_FULL){ why="market closed / restricted"; return false; }
+   if(InpMaxSpreadATR>0 && atr>0)
+     { Sym.RefreshRates(); if(Sym.Ask()-Sym.Bid()>InpMaxSpreadATR*atr){ why="spread too wide"; return false; } }
+   string vw;
+   if(!InpIgnoreViabilityCheck && !ViabilityCheck(vw)){ why=vw; return false; }
+   return true;
+  }
+
+bool OpenCampaign(int dir)
+  {
+   string why;
+   if(!Gates(why)){ g_note=why; g_blocked=true; return false; }
+   g_blocked=false;
+   return g_layered?OpenLayer1(dir):OpenBase(dir);
+  }
+
+void TryEntry()
+  {
+   if(BasketCount()>0) return;
+   if(InpReentryCooldownSec>0 && (TimeCurrent()-g_lastExitTime)<InpReentryCooldownSec){ g_note="re-entry cooldown"; return; }
+   int d=EntryDirection(false);
+   if(d==0){ if(g_confDir==0) g_note="no direction yet"; return; }
+   g_note="entering "+DirStr(d);
+   OpenCampaign(d);
+  }
+
+void ManageBasket()
+  {
+   if(BasketCount()==0){ if(g_dir!=0) ResetCampaign(); return; }
+   if(g_dir==0) g_dir=BasketDir();
+
+   double profit=BasketProfit(),bal=Bal();
+   bool fixedMode=(InpUseFixedTPSL && g_layered);
+
+   // in fixed mode the broker-side TP and staged trailing SL replace the money target / profit lock
+   if(!fixedMode)
+     {
+      double target=(InpTargetMode==TGT_PCT_BALANCE)?bal*InpTargetPct/100.0:InpTargetCash;
+      if(profit>=target){ CloseBasket(StringFormat("target +%.2f",profit)); return; }
+     }
+   if(profit<=-StopCash()){ CloseBasket(StringFormat("basket stop %.2f",profit)); return; }
+
+   if(!fixedMode)
+     {
+      g_peakBasket=MathMax(g_peakBasket,profit);
+      if(g_peakBasket>=bal*InpTrailStartPct/100.0) g_locked=true;
+      if(g_locked && profit<=bal*InpTrailLockPct/100.0){ CloseBasket(StringFormat("profit lock +%.2f",profit)); return; }
+     }
+
+   // flip with the market - stop and reverse on the same tick
+   if(InpFlipOnReverse && g_confDir!=0 && g_confDir!=g_dir)
+     {
+      int nd=g_confDir;
+      CloseBasket(StringFormat("flip %s -> %s",DirStr(g_dir),DirStr(nd)));
+      if(InpStopAndReverse && BasketCount()==0)
+        {
+         int d=EntryDirection(true);
+         if(d==nd){ g_note="reversed to "+DirStr(nd); OpenCampaign(nd); }
+        }
+     }
+  }
+
+void OnNewBar()
+  {
+   if(BasketCount()>0)
+     {
+      g_barsHeld++;
+      if(InpMaxHoldBars>0 && g_barsHeld>=InpMaxHoldBars && BasketProfit()<0) CloseBasket("time exit");
+      return;
+     }
+   if(!InpIntrabarEntry) TryEntry();
+  }
+
+// rebuild tracking after a restart / recompile with positions open
+void RecoverState()
+  {
+   ulong tk[]; long tm[]; int n=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+      if(Pos.SelectByIndex(i)&&Mine())
+        { ArrayResize(tk,n+1); ArrayResize(tm,n+1); tk[n]=Pos.Ticket(); tm[n]=(long)PositionGetInteger(POSITION_TIME_MSC); n++; }
+   if(n==0) return;
+   for(int a=0;a<n-1;a++) for(int b=0;b<n-1-a;b++)
+      if(tm[b]>tm[b+1]){ long t=tm[b]; tm[b]=tm[b+1]; tm[b+1]=t; ulong k=tk[b]; tk[b]=tk[b+1]; tk[b+1]=k; }
+   g_dir=BasketDir(); g_adds=n-1;
+   if(PositionSelectByTicket(tk[0])) g_baseLot=PositionGetDouble(POSITION_VOLUME);
+   if(PositionSelectByTicket(tk[n-1])) g_lastEntry=PositionGetDouble(POSITION_PRICE_OPEN);
+   if(g_layered)
+     {
+      g_nPos=(int)MathMin(n,MAX_POS); g_nLayers=1;
+      for(int j=0;j<g_nPos;j++)
+         if(PositionSelectByTicket(tk[j]))
+           {
+            g_pTicket[j]=tk[j]; g_pEntry[j]=PositionGetDouble(POSITION_PRICE_OPEN); g_pSL[j]=PositionGetDouble(POSITION_SL); g_pLots[j]=PositionGetDouble(POSITION_VOLUME);
+            string c=PositionGetString(POSITION_COMMENT);
+            int ly=1; if(StringFind(c,"pyrL")==0) ly=(int)MathMax(1,StringToInteger(StringSubstr(c,4)));
+            g_pLayer[j]=ly; if(ly>g_nLayers) g_nLayers=ly;
+           }
+      g_adds=g_nLayers-1;
+      if(InpUseFixedTPSL)
+        {
+         g_tpDist=PipDist(InpTPPips);
+         g_tpPrice=0; if(PositionSelectByTicket(tk[0])) g_tpPrice=PositionGetDouble(POSITION_TP);
+         if(g_tpPrice<=0){ g_entry0=g_pEntry[0]; g_tpPrice=Nrm(g_entry0+g_dir*g_tpDist); }
+         else g_entry0=Nrm(g_tpPrice-g_dir*g_tpDist);          // campaign entry derived from the shared TP
+         g_campaignR=PipDist(SLPips());
+         g_campaignSLPrice=Nrm(g_entry0-g_dir*g_campaignR);
+         g_trailSL=0; g_trailStage=-1;
+         if(g_pSL[0]>0 && g_dir*(g_pSL[0]-g_campaignSLPrice)>_Point) g_trailSL=g_pSL[0];
+        }
+      else
+        {
+         g_entry0=g_pEntry[0];
+         double r=InpInitialStopATR*atr;
+         g_campaignSLPrice=(g_pSL[g_nPos-1]>0)?g_pSL[g_nPos-1]:g_pEntry[0]-g_dir*r;
+         g_campaignR=(r>0)?r:MathAbs(g_pEntry[0]-g_campaignSLPrice);
+        }
+     }
+   LG("RECOVER",StringFormat("resumed %s basket: %d position(s), %d layer(s), %.2f lots",DirStr(g_dir),n,g_nLayers,BasketLots()));
+  }
+
+//+------------------------------------------------------------------+
+//| Dashboard                                                        |
+//+------------------------------------------------------------------+
+void Lbl(string id,int x,int y,string txt,color clr)
+  {
+   string n="PYR_L_"+id;
+   if(ObjectFind(0,n)<0)
+     { ObjectCreate(0,n,OBJ_LABEL,0,0,0); ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false); ObjectSetString(0,n,OBJPROP_FONT,"Consolas"); }
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt); ObjectSetInteger(0,n,OBJPROP_COLOR,clr); ObjectSetInteger(0,n,OBJPROP_FONTSIZE,InpFontSize);
+  }
+void Dashboard()
+  {
+   if(!InpShowDashboard) return;
+   int lh=InpFontSize+6,x=12,y=24,i=0; color cH=clrWhite,cM=clrSilver,cG=clrLimeGreen,cR=clrTomato,cY=clrGold;
+   string n="PYR_PANEL";
+   if(ObjectFind(0,n)<0)
+     { ObjectCreate(0,n,OBJ_RECTANGLE_LABEL,0,0,0); ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,n,OBJPROP_BGCOLOR,C'16,20,28'); ObjectSetInteger(0,n,OBJPROP_BORDER_TYPE,BORDER_FLAT); ObjectSetInteger(0,n,OBJPROP_COLOR,clrDimGray); ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false); }
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,6); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,18); ObjectSetInteger(0,n,OBJPROP_XSIZE,470); ObjectSetInteger(0,n,OBJPROP_YSIZE,lh*11+12);
+   double bal=Bal(),prof=BasketProfit();
+   Lbl("a",x,y+lh*i++,StringFormat("  %s %s PYRAMID SCALPER v4 %s  24/7",_Symbol,EnumToString(InpTF),g_layered?"[LAYERED]":"[LADDER]"),cH);
+   Lbl("b",x,y+lh*i++,"---------------------------------------------------",cM);
+   if(g_layered) Lbl("c",x,y+lh*i++,StringFormat("Bal %.2f | %.1f%%/layer | %d/%d layers x %d pos | %.1f%% total",bal,InpLayerRiskPct,g_nLayers,NumLayersAllowed(),PosPerLayer(),InpTotalRiskPct),cM);
+   else          Lbl("c",x,y+lh*i++,StringFormat("Bal %.2f | step %.2f | %d rungs | max %.2f lots",bal,BaseLot(),LadderSteps(),MaxTotalLots()),cM);
+   Lbl("d",x,y+lh*i++,StringFormat("TREND %s  raw %s  gap %.2f band %.2f  flips %d",DirStr(g_confDir),DirStr(g_rawDir),g_fast-g_slow,InpFlipBandATR*atr,g_flips),g_confDir>0?cG:(g_confDir<0?cR:cY));
+   if(g_pendDir!=g_confDir)
+      Lbl("p",x,y+lh*i++,StringFormat("pending %s  %d/%d ticks  %d/%d ms",DirStr(g_pendDir),g_pendTicks,InpFlipConfirmTicks,(int)(NowMs()-g_pendSinceMs),InpFlipConfirmMs),cY);
+   else Lbl("p",x,y+lh*i++,"pending -",cM);
+   if(BasketCount()>0) Lbl("e",x,y+lh*i++,StringFormat("IN %s  %d pos  %.2f lots  P/L %.2f %s",g_dir>0?"LONG":"SHORT",BasketCount(),BasketLots(),prof,g_locked?"LOCKED":""),prof>=0?cG:cR);
+   else                Lbl("e",x,y+lh*i++,"FLAT",cM);
+   double target=(InpTargetMode==TGT_PCT_BALANCE)?bal*InpTargetPct/100.0:InpTargetCash;
+   if(g_layered)
+     {
+      double progR=0,progTP=0;
+      if(g_nLayers>0 && g_campaignR>0){ Sym.RefreshRates(); double p=(g_dir>0)?Sym.Bid():Sym.Ask(); progR=g_dir*(p-g_entry0)/g_campaignR; if(g_tpDist>0) progTP=g_dir*(p-g_entry0)/g_tpDist*100.0; }
+      if(InpUseFixedTPSL)
+         Lbl("f",x,y+lh*i++,StringFormat("TP %s  SL %s  @ %.0f%% TP  stage %d/%d",g_tpPrice>0?DoubleToString(g_tpPrice,_Digits):"-",g_trailSL>0?DoubleToString(g_trailSL,_Digits):(g_campaignSLPrice>0?DoubleToString(g_campaignSLPrice,_Digits):"-"),progTP,g_trailStage+1,TRAIL_STAGES),cM);
+      else
+         Lbl("f",x,y+lh*i++,StringFormat("target +%.2f  SL %s  @ %.2fR (next %.2fR)",target,g_campaignSLPrice>0?DoubleToString(g_campaignSLPrice,_Digits):"-",progR,LayerTriggerR(g_nLayers)),cM);
+     }
+   else Lbl("f",x,y+lh*i++,StringFormat("target +%.2f  stop -%.2f  rung %d/%d",target,StopCash(),g_adds,MaxAdds()),cM);
+   Lbl("g",x,y+lh*i++,StringFormat("Day %+.2f  baskets %d %s",g_dayPnL,g_dayBaskets,g_dayStopped?"STOPPED":""),g_dayPnL>=0?cG:cR);
+   int cl=g_nWins+g_nLosses;
+   Lbl("h",x,y+lh*i++,StringFormat("Session %d baskets  win %.0f%%  PF %.2f",cl,cl>0?100.0*g_nWins/cl:0,g_grossLoss>0?g_grossWin/g_grossLoss:0),cH);
+   Lbl("i",x,y+lh*i++,(g_blocked?"BLOCKED: ":"Note: ")+g_note,g_blocked?cR:cY);
+   ChartRedraw(0);
+  }
+
+//+------------------------------------------------------------------+
+//| Events                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   Sym.Name(_Symbol);
+   Trade.SetExpertMagicNumber(InpMagic); Trade.SetDeviationInPoints(InpDeviationPoints); Trade.LogLevel(LOG_LEVEL_ERRORS);
+   hATR=iATR(_Symbol,InpTF,InpATRPeriod);
+   hTrF=iMA(_Symbol,InpTrendTF,InpTrendFast,0,MODE_EMA,PRICE_CLOSE);
+   hTrS=iMA(_Symbol,InpTrendTF,InpTrendSlow,0,MODE_EMA,PRICE_CLOSE);
+   if(InpTrendFilter!=TFILT_OFF && InpEMATrend>0) hTr200=iMA(_Symbol,InpTrendTF,InpEMATrend,0,MODE_EMA,PRICE_CLOSE);
+   if(hATR==INVALID_HANDLE||hTrF==INVALID_HANDLE||hTrS==INVALID_HANDLE){ LG("ERROR","indicator handle failed"); return INIT_FAILED; }
+   if(InpTrendFast>=InpTrendSlow){ LG("ERROR","InpTrendFast must be < InpTrendSlow"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpUseFixedTPSL && (InpTPPips<=0||SLPips()<=0||InpPointsPerPip<=0)){ LG("ERROR","TP/SL pips and points-per-pip must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpPositionsPerLayer<1||InpPositionsPerLayer>10){ LG("ERROR","InpPositionsPerLayer must be 1..10"); return INIT_PARAMETERS_INCORRECT; }
+
+   bool hedging=(AccountInfoInteger(ACCOUNT_MARGIN_MODE)==ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+   g_layered=InpUseLayeredRisk && hedging;
+   if(InpUseLayeredRisk && !hedging)
+      LG("WARN","NETTING account: positions would merge into one, so per-position SL/breakeven cannot work. Running LADDER mode (fixed TP/SL, 5 positions per layer and staged trail are NOT active in ladder mode).");
+
+   g_day=DayStart(TimeCurrent()); g_dayStartBalance=Bal();
+   atr=Buf(hATR,1);
+   RecoverState();
+
+   LG("INFO",StringFormat("v4.03 on %s | bal %.2f | $/1.0 price/lot %.2f | direction EMA%d/%d %s on %s bar | band %.2fxATR | confirm %d ms + %d ticks | trend filter %s | SAR %s | 24/7",
+        _Symbol,Bal(),MoneyPerLotPerPrice(),InpTrendFast,InpTrendSlow,EnumToString(InpTrendTF),InpUseFormingBar?"FORMING":"closed",
+        InpFlipBandATR,InpFlipConfirmMs,InpFlipConfirmTicks,EnumToString(InpTrendFilter),InpStopAndReverse?"on":"off"));
+   if(g_layered) LG("INFO",StringFormat("LAYERED: %d layers x %d positions | %.1f%% risk per layer = %.1f%% planned total",NumLayersAllowed(),PosPerLayer(),InpLayerRiskPct,InpLayerRiskPct*NumLayersAllowed()));
+   if(g_layered && InpUseFixedTPSL)
+     {
+      LG("INFO",StringFormat("FIXED TP/SL: TP %.0f pips (%.2f price) | SL %.0f pips (%.2f price) | 1 pip = %.0f points | staged trail %s | BE at %.0f%% TP %s",
+           InpTPPips,PipDist(InpTPPips),SLPips(),PipDist(SLPips()),InpPointsPerPip,InpUseStagedTrail?"ON":"OFF",InpBEMovePct,InpUseBEMove?"ON":"OFF"));
+      LG("INFO",StringFormat("LAYER TRIGGERS (%% of TP): L2 %.0f | L3 %.0f | L4 %.0f | L5 %.0f | L6 %.0f",
+           InpLayer2TriggerPct,InpLayer3TriggerPct,InpLayer4TriggerPct,InpLayer5TriggerPct,InpLayer6TriggerPct));
+     }
+   string vw; if(atr>0 && !ViabilityCheck(vw)) LG("WARN","ACCOUNT SMALL FOR CURRENT VOLATILITY: "+vw);
+   EventSetTimer(1);
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   if(hATR!=INVALID_HANDLE) IndicatorRelease(hATR);
+   if(hTrF!=INVALID_HANDLE) IndicatorRelease(hTrF);
+   if(hTrS!=INVALID_HANDLE) IndicatorRelease(hTrS);
+   if(hTr200!=INVALID_HANDLE) IndicatorRelease(hTr200);
+   if(reason!=REASON_CHARTCHANGE && reason!=REASON_PARAMETERS) ObjectsDeleteAll(0,"PYR_");
+  }
+
+void OnTick()
+  {
+   atr=Buf(hATR,1);
+   if(atr<=0) return;
+   UpdateDirection();                          // every tick
+   if(g_layered){ SyncLayers(); ApplyStagedTrail(); ApplyBreakevenRule(); }   // trail SL + per-position BE on every tick
+   ManageBasket();                             // includes stop-and-reverse
+   if(BasketCount()>0){ if(g_layered) TryLayeredPyramid(); else TryPyramid(); }
+   else if(InpIntrabarEntry) TryEntry();
+   datetime bt=iTime(_Symbol,InpTF,0);
+   if(bt!=g_lastBar && bt!=0){ g_lastBar=bt; OnNewBar(); if(MQLInfoInteger(MQL_TESTER)) Dashboard(); }
+  }
+
+void OnTimer(){ if(!MQLInfoInteger(MQL_TESTER)) Dashboard(); }
+
+double OnTester()
+  {
+   int cl=g_nWins+g_nLosses;
+   Print(StringFormat("===== v4.03: %d baskets  win %.1f%%  PF %.2f  net %.2f  flips %d =====",
+        cl,cl>0?100.0*g_nWins/cl:0,g_grossLoss>0?g_grossWin/g_grossLoss:0,g_grossWin-g_grossLoss,g_flips));
+   double pf=TesterStatistics(STAT_PROFIT_FACTOR),tr=TesterStatistics(STAT_TRADES),dd=TesterStatistics(STAT_EQUITY_DDREL_PERCENT);
+   if(tr<30) return 0;
+   return MathMin(pf,3.0)*MathSqrt(MathMin(tr,300.0))-dd/5.0;
+  }
+//+------------------------------------------------------------------+
