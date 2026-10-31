@@ -1,0 +1,769 @@
+//+------------------------------------------------------------------+
+//|                              XAUUSD_SinglePosition_v5.mq5        |
+//|                                                                  |
+//|  v5.00 - ONE POSITION AT A TIME, 1:3 REWARD, 5-STAGE TRAIL       |
+//|   * One position, one layer. No pyramiding.                      |
+//|   * SL = 200 pips, TP = 600 pips (broker-side).                  |
+//|   * LOT SIZE                                                     |
+//|        Strategy Tester / optimization : always 0.01              |
+//|        Live / demo : 0.01 lot per 400 of balance                 |
+//|            400 -> 0.01 | 800 -> 0.02 | 1200 -> 0.03 | ...        |
+//|   * TRAIL (fractions of TP distance, from the entry price):      |
+//|        reached 20% of TP -> SL to  1% of TP                      |
+//|        reached 50% of TP -> SL to 20% of TP                      |
+//|        reached 70% of TP -> SL to 50% of TP                      |
+//|        reached 80% of TP -> SL to 60% of TP                      |
+//|        reached 90% of TP -> SL to 80% of TP                      |
+//|     SL only moves forward.                                       |
+//|   * GOOGLE SHEET LIVE REPORT: a row is added when a position     |
+//|     opens and completed when it closes (WebRequest -> Google     |
+//|     Apps Script web app). Not sent inside the Strategy Tester.   |
+//|   * Direction engine (EMA 5/20, hysteresis, confirm, stop-and-   |
+//|     reverse) is unchanged from v4.06. Trades 24/7.               |
+//+------------------------------------------------------------------+
+#property copyright "XAUUSD Single Position Scalper"
+#property version   "5.00"
+#property description "One position at a time, SL 200 / TP 600 pips, staged trail, dynamic lot, Google Sheets report"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+enum ENUM_TREND_FILTER { TFILT_OFF=0, TFILT_ENTRY_ONLY=1, TFILT_STRICT=2 };
+
+#define RPT_EMA_FAST 9      // report columns "EMA 9"
+#define RPT_EMA_SLOW 20     // report columns "EMA 20"
+#define RPT_SMA      9      // report column  "SMA 9"
+
+//+------------------------------------------------------------------+
+input group "=== SL / TP (1:3 reward) ==="
+input double InpSLPips           = 400.0;     // stop loss, pips (200 pips = 20.00 price on 2-digit gold)
+input double InpTPPips           = 1200.0;     // take profit, pips (600 pips = 60.00 price)
+input double InpPointsPerPip     = 10.0;      // points per pip. Gold 2-digit: 10 => 1 pip = 0.10 price
+
+input group "=== Lot size ==="
+input double InpTesterLot        = 0.01;      // lot used in Strategy Tester / optimization (always fixed)
+input double InpBalancePerStep   = 400.0;     // live/demo: one lot step per this much balance
+input double InpLotPerStep       = 0.01;      // live/demo: lot added per step (400->0.01, 800->0.02, 1200->0.03 ...)
+input double InpMaxLot           = 0.0;       // absolute lot cap, 0 = off
+input bool   InpFixedLotEverywhere = false;   // true = use InpTesterLot on live/demo too
+
+input group "=== Staged trailing SL (% of TP distance, from entry) ==="
+input bool   InpUseTrail         = true;
+input double InpTrail1Trigger    = 20.0;  input double InpTrail1Lock = 1.0;    // at 20% of TP -> SL at 1%
+input double InpTrail2Trigger    = 50.0;  input double InpTrail2Lock = 20.0;   // at 50% of TP -> SL at 20%
+input double InpTrail3Trigger    = 70.0;  input double InpTrail3Lock = 50.0;   // at 70% of TP -> SL at 50%
+input double InpTrail4Trigger    = 80.0;  input double InpTrail4Lock = 60.0;   // at 80% of TP -> SL at 60%
+input double InpTrail5Trigger    = 90.0;  input double InpTrail5Lock = 80.0;   // at 90% of TP -> SL at 80%
+
+input group "=== Google Sheet live report ==="
+input bool   InpSheetEnabled     = true;      // send open / close events to Google Sheets
+input string InpSheetURL         = "https://script.google.com/macros/s/AKfycbwn3b94V6ll3Cbuke760ywkAV6xWTCqm1RBcoYytuTVQO7FUuVIIhEIhOfmuMuzbrJv/exec";        // Apps Script web app URL (https://script.google.com/macros/s/.../exec)
+input string InpSheetToken       = "CHANGE_MEv8"; // must match SECRET in the Apps Script
+input int    InpWebTimeoutMs     = 5000;      // WebRequest timeout
+
+input group "=== Indicators written to the report (value at entry, last CLOSED bar) ==="
+input ENUM_TIMEFRAMES InpRptTF   = PERIOD_M1; // timeframe the report indicators are read on
+input int    InpRptADXPeriod     = 14;        // ADX / +DI / -DI period
+input int    InpRptATRPeriod     = 14;        // ATR period
+input int    InpRptBBPeriod      = 20;        // Bollinger Bands period
+input double InpRptBBDev         = 2.0;       // Bollinger Bands deviation
+
+input group "=== Direction engine (re-checked EVERY tick) ==="
+input ENUM_TIMEFRAMES   InpTF               = PERIOD_M1;   // bar TF: ATR, hold timer
+input ENUM_TIMEFRAMES   InpTrendTF          = PERIOD_M1;   // direction timeframe
+input int               InpTrendFast        = 5;           // fast EMA
+input int               InpTrendSlow        = 20;          // slow EMA
+input bool              InpUseFormingBar    = true;        // true = read EMAs on forming bar (intrabar flips)
+input double            InpFlipBandATR      = 0.05;        // hysteresis: EMA gap must pass N x ATR on the other side to flip
+input int               InpFlipConfirmMs    = 1500;        // new direction must persist N ms (0 = instant)
+input int               InpFlipConfirmTicks = 3;           // ... and at least N ticks
+input bool              InpMomentumConfirm  = true;        // flip only if price is on the new side of the fast EMA
+input ENUM_TREND_FILTER InpTrendFilter      = TFILT_OFF;   // EMA-trend filter: OFF / block counter-trend ENTRIES only / STRICT
+input int               InpEMATrend         = 200;         // trend-filter EMA period
+input double            InpEntrySepATR      = 0.10;        // fresh entries need EMA gap >= N x ATR (not applied to reversals)
+input bool              InpFlipOnReverse    = true;        // close the position when direction flips
+input bool              InpStopAndReverse   = true;        // ... and immediately open the opposite side
+input bool              InpIntrabarEntry    = true;        // look for entries on every tick
+input int               InpReentryCooldownSec = 3;         // wait after a NON-flip exit before re-entering
+input int               InpATRPeriod        = 14;
+input int               InpMaxHoldBars      = 0;           // close a LOSING position after N bars of InpTF (0 = off)
+
+input group "=== Safety ==="
+input double InpMaxDailyLossPct  = 0.0;       // 0 = off
+input double InpDailyProfitLock  = 0.0;       // 0 = off
+input int    InpMaxTradesPerDay  = 0;         // 0 = unlimited
+input double InpMaxSpreadATR     = 0.0;       // 0 = off
+
+input group "=== Execution ==="
+input long   InpMagic            = 990099;
+input int    InpDeviationPoints  = 60;
+input bool   InpShowDashboard    = true;
+input int    InpFontSize         = 9;
+
+//+------------------------------------------------------------------+
+CTrade Trade; CPositionInfo Pos; CSymbolInfo Sym;
+int    hATR=INVALID_HANDLE,hTrF=INVALID_HANDLE,hTrS=INVALID_HANDLE,hTr200=INVALID_HANDLE;
+double atr=0,g_fast=0,g_slow=0,g_e200=0;
+
+// report-only indicator handles
+int hR_E9=INVALID_HANDLE,hR_E20=INVALID_HANDLE,hR_S9=INVALID_HANDLE,hR_ADX=INVALID_HANDLE,hR_ATR=INVALID_HANDLE,hR_BB=INVALID_HANDLE;
+
+// direction engine
+int  g_rawDir=0,g_confDir=0,g_pendDir=0,g_pendTicks=0,g_flips=0;
+long g_pendSinceMs=0;
+
+// trade state
+ulong    g_ticket=0;              // the one live position (0 = flat)
+int      g_dir=0,g_barsHeld=0,g_trailStage=-1;
+string   g_note="starting";
+bool     g_blocked=false;
+datetime g_day=0,g_lastBar=0,g_lastExitTime=0;
+double   g_dayStartBalance=0,g_dayPnL=0; int g_dayTrades=0; bool g_dayStopped=false;
+int      g_nTrades=0,g_nWins=0,g_nLosses=0; double g_grossWin=0,g_grossLoss=0;
+
+// trail table (fractions of TP)
+double g_trTrig[5],g_trLock[5];
+
+// closed positions waiting for their deal history to be readable
+ulong    g_pend[];
+datetime g_pendT[];
+
+// google sheet queue
+string   g_q[];
+int      g_failCount=0;
+datetime g_nextSend=0;
+
+//+------------------------------------------------------------------+
+//| Utilities                                                        |
+//+------------------------------------------------------------------+
+void     LG(string t,string m){ Print("[",t,"] ",m); }
+datetime DayStart(datetime t){ MqlDateTime d; TimeToStruct(t,d); d.hour=0; d.min=0; d.sec=0; return StructToTime(d); }
+double   Nrm(double p){ return NormalizeDouble(p,_Digits); }
+double   Buf(int h,int sh){ if(h==INVALID_HANDLE) return 0; double b[]; if(CopyBuffer(h,0,sh,1,b)!=1) return 0; return b[0]; }
+double   Buf2(int h,int buf,int sh){ if(h==INVALID_HANDLE) return 0; double b[]; if(CopyBuffer(h,buf,sh,1,b)!=1) return 0; return b[0]; }
+double   Bal(){ return AccountInfoDouble(ACCOUNT_BALANCE); }
+string   DirStr(int d){ return d>0?"BUY":(d<0?"SELL":"flat"); }
+double   PipDist(double pips){ return pips*InpPointsPerPip*_Point; }
+bool     InTester(){ return (bool)MQLInfoInteger(MQL_TESTER); }
+
+double MoneyPerLotPerPrice()
+  {
+   double tv=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE),ts=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   if(tv<=0||ts<=0) return 0;
+   return tv/ts;
+  }
+double NormLot(double lots)
+  {
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+   double mn=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),mx=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   lots=MathFloor(lots/step+1e-9)*step;
+   if(lots<mn) lots=mn;
+   if(mx>0 && lots>mx) lots=mx;
+   return NormalizeDouble(lots,2);
+  }
+// Backtest: always InpTesterLot.  Live/demo: one InpLotPerStep per InpBalancePerStep of balance (minimum one step).
+double CalcLots()
+  {
+   double lots;
+   if(InTester() || InpFixedLotEverywhere) lots=InpTesterLot;
+   else
+     {
+      int steps=(int)MathFloor(Bal()/MathMax(InpBalancePerStep,1.0)+1e-9);
+      if(steps<1) steps=1;
+      lots=steps*InpLotPerStep;
+     }
+   if(InpMaxLot>0 && lots>InpMaxLot) lots=InpMaxLot;
+   return NormLot(lots);
+  }
+double StopsDist()
+  {
+   long lv=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL),fz=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
+   return (double)MathMax(lv,fz)*_Point+2*_Point;
+  }
+long   NowMs(){ MqlTick t; if(SymbolInfoTick(_Symbol,t)) return (long)t.time_msc; return (long)TimeCurrent()*1000; }
+double Mid(){ Sym.RefreshRates(); return (Sym.Bid()+Sym.Ask())*0.5; }
+
+// widen an SL if it violates the broker's stops level
+double SafeSL(int dir,double sl)
+  {
+   Sym.RefreshRates(); double md=StopsDist();
+   if(dir>0){ double lim=Sym.Bid()-md; if(sl>lim) sl=lim; }
+   else     { double lim=Sym.Ask()+md; if(sl<lim) sl=lim; }
+   return Nrm(sl);
+  }
+bool MarginOK(int dir,double lots)
+  {
+   double m=0; Sym.RefreshRates();
+   double px=(dir>0)?Sym.Ask():Sym.Bid();
+   if(!OrderCalcMargin(dir>0?ORDER_TYPE_BUY:ORDER_TYPE_SELL,_Symbol,lots,px,m)) return true;
+   return m<AccountInfoDouble(ACCOUNT_MARGIN_FREE)*0.95;
+  }
+
+//+------------------------------------------------------------------+
+//| Position helpers (this EA's single position)                     |
+//+------------------------------------------------------------------+
+bool FindMine()
+  {
+   for(int i=PositionsTotal()-1;i>=0;i--)
+      if(Pos.SelectByIndex(i) && Pos.Symbol()==_Symbol && Pos.Magic()==InpMagic) return true;
+   return false;
+  }
+bool HaveTrade(){ return FindMine(); }
+
+//+------------------------------------------------------------------+
+//| Google Sheets reporting                                          |
+//+------------------------------------------------------------------+
+bool SheetOn(){ return InpSheetEnabled && StringLen(InpSheetURL)>10 && !InTester(); }
+
+string JEsc(string v){ StringReplace(v,"\\","\\\\"); StringReplace(v,"\"","\\\""); return v; }
+string JS(string k,string v){ return "\""+k+"\":\""+JEsc(v)+"\""; }
+string JN(string k,double v,int dg){ return "\""+k+"\":"+DoubleToString(v,dg); }
+string TStr(datetime t){ return TimeToString(t,TIME_DATE|TIME_SECONDS); }
+
+string ModeStr()
+  {
+   long m=AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(m==ACCOUNT_TRADE_MODE_REAL) return "LIVE";
+   if(m==ACCOUNT_TRADE_MODE_CONTEST) return "CONTEST";
+   return "DEMO";
+  }
+string ReasonStr(long r)
+  {
+   switch((int)r)
+     {
+      case DEAL_REASON_SL:     return "SL";
+      case DEAL_REASON_TP:     return "TP";
+      case DEAL_REASON_SO:     return "STOP OUT";
+      case DEAL_REASON_EXPERT: return "EA (flip/exit)";
+      case DEAL_REASON_CLIENT: return "MANUAL";
+      case DEAL_REASON_MOBILE: return "MANUAL (mobile)";
+      case DEAL_REASON_WEB:    return "MANUAL (web)";
+     }
+   return "OTHER";
+  }
+string JHead(string ev,ulong ticket)
+  {
+   return "{"+JS("token",InpSheetToken)+","+JS("event",ev)+","+JS("ticket",StringFormat("%I64u",ticket))+","+JS("symbol",_Symbol)
+          +","+JS("account",StringFormat("%I64d",AccountInfoInteger(ACCOUNT_LOGIN)))+","+JS("mode",ModeStr());
+  }
+void QPush(string j)
+  {
+   int n=ArraySize(g_q);
+   if(n>=500){ for(int i=1;i<n;i++) g_q[i-1]=g_q[i]; n--; ArrayResize(g_q,n); }
+   ArrayResize(g_q,n+1); g_q[n]=j;
+  }
+void QPop()
+  {
+   int n=ArraySize(g_q); if(n==0) return;
+   for(int i=1;i<n;i++) g_q[i-1]=g_q[i];
+   ArrayResize(g_q,n-1);
+  }
+// indicator snapshot for the OPEN row (last closed bar of InpRptTF; candle gap = forming-bar open minus previous close)
+string IndicatorJson()
+  {
+   int sh=1;
+   double e9=Buf2(hR_E9,0,sh),e20=Buf2(hR_E20,0,sh),s9=Buf2(hR_S9,0,sh);
+   double adx=Buf2(hR_ADX,0,sh),pdi=Buf2(hR_ADX,1,sh),mdi=Buf2(hR_ADX,2,sh);
+   double a=Buf2(hR_ATR,0,sh);
+   double bm=Buf2(hR_BB,0,sh),bu=Buf2(hR_BB,1,sh),bl=Buf2(hR_BB,2,sh);
+   double pip=InpPointsPerPip*_Point;
+   double c1=iClose(_Symbol,InpRptTF,1);
+   double pctB=(bu-bl>0)?(c1-bl)/(bu-bl):0;                 // 0 = lower band, 1 = upper band
+   double gap=(pip>0)?(iOpen(_Symbol,InpRptTF,0)-c1)/pip:0; // + = gap up, - = gap down
+   return ","+JN("ema9",e9,_Digits)+","+JN("ema20",e20,_Digits)+","+JN("sma9",s9,_Digits)
+         +","+JN("adx",adx,2)+","+JN("plus_di",pdi,2)+","+JN("minus_di",mdi,2)
+         +","+JN("atr",a,2)+","+JN("atr_pips",(pip>0)?a/pip:0,1)
+         +","+JN("bb_upper",bu,_Digits)+","+JN("bb_mid",bm,_Digits)+","+JN("bb_lower",bl,_Digits)+","+JN("bb_pctb",pctB,3)
+         +","+JN("candle_gap_pips",gap,1);
+  }
+void QueueOpen(ulong tk)
+  {
+   if(!SheetOn() || !PositionSelectByTicket(tk)) return;
+   int dir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?1:-1;
+   string j=JHead("OPEN",tk)
+      +","+JS("type",dir>0?"BUY":"SELL")
+      +","+JN("lots",PositionGetDouble(POSITION_VOLUME),2)
+      +","+JS("open_time",TStr((datetime)PositionGetInteger(POSITION_TIME)))
+      +","+JN("open_price",PositionGetDouble(POSITION_PRICE_OPEN),_Digits)
+      +","+JN("sl",PositionGetDouble(POSITION_SL),_Digits)
+      +","+JN("tp",PositionGetDouble(POSITION_TP),_Digits)
+      +","+JN("balance",Bal(),2)
+      +","+JN("equity",AccountInfoDouble(ACCOUNT_EQUITY),2)
+      +IndicatorJson()+"}";
+   QPush(j);
+  }
+
+// read the finished position from deal history, update stats, queue the CLOSE row. false = history not ready yet.
+bool BuildCloseReport(ulong posId)
+  {
+   if(!HistorySelectByPosition(posId)) return false;
+   int total=HistoryDealsTotal();
+   bool out=false; int dir=0;
+   datetime openT=0,closeT=0; double openP=0,closeP=0,lots=0,profit=0,swap=0,comm=0,fee=0; long reason=0;
+   for(int i=0;i<total;i++)
+     {
+      ulong dt=HistoryDealGetTicket(i); if(dt==0) continue;
+      long en=HistoryDealGetInteger(dt,DEAL_ENTRY);
+      profit+=HistoryDealGetDouble(dt,DEAL_PROFIT);
+      swap  +=HistoryDealGetDouble(dt,DEAL_SWAP);
+      comm  +=HistoryDealGetDouble(dt,DEAL_COMMISSION);
+      fee   +=HistoryDealGetDouble(dt,DEAL_FEE);
+      if(en==DEAL_ENTRY_IN)
+        {
+         openT=(datetime)HistoryDealGetInteger(dt,DEAL_TIME); openP=HistoryDealGetDouble(dt,DEAL_PRICE);
+         lots=HistoryDealGetDouble(dt,DEAL_VOLUME);
+         dir=(HistoryDealGetInteger(dt,DEAL_TYPE)==DEAL_TYPE_BUY)?1:-1;
+        }
+      else if(en==DEAL_ENTRY_OUT||en==DEAL_ENTRY_OUT_BY||en==DEAL_ENTRY_INOUT)
+        {
+         out=true; closeT=(datetime)HistoryDealGetInteger(dt,DEAL_TIME); closeP=HistoryDealGetDouble(dt,DEAL_PRICE);
+         reason=HistoryDealGetInteger(dt,DEAL_REASON);
+        }
+     }
+   if(!out) return false;
+
+   double net=profit+swap+comm+fee;
+   double pips=(dir!=0)?dir*(closeP-openP)/(InpPointsPerPip*_Point):0;
+   g_dayPnL+=net; g_nTrades++;
+   if(net>0){ g_nWins++; g_grossWin+=net; } else if(net<0){ g_nLosses++; g_grossLoss+=-net; }
+   LG("TRADE",StringFormat("#%I64u %s %.2f closed by %s | %.1f pips | net %.2f | day %+.2f",posId,DirStr(dir),lots,ReasonStr(reason),pips,net,g_dayPnL));
+
+   if(SheetOn())
+     {
+      string j=JHead("CLOSE",posId)
+         +","+JS("type",dir>0?"BUY":"SELL")
+         +","+JN("lots",lots,2)
+         +","+JS("open_time",TStr(openT))
+         +","+JN("open_price",openP,_Digits)
+         +","+JS("close_time",TStr(closeT))
+         +","+JN("close_price",closeP,_Digits)
+         +","+JS("reason",ReasonStr(reason))
+         +","+JN("profit",profit,2)
+         +","+JN("swap",swap,2)
+         +","+JN("commission",comm+fee,2)
+         +","+JN("net",net,2)
+         +","+JN("pips",pips,1)
+         +","+JN("balance",Bal(),2)
+         +","+JN("equity",AccountInfoDouble(ACCOUNT_EQUITY),2)+"}";
+      QPush(j);
+     }
+   return true;
+  }
+
+// the tracked position vanished (SL / TP / flip / manual): park it until its deals are readable
+void CheckClosed()
+  {
+   if(g_ticket==0) return;
+   if(PositionSelectByTicket(g_ticket)) return;
+   int n=ArraySize(g_pend);
+   ArrayResize(g_pend,n+1); ArrayResize(g_pendT,n+1);
+   g_pend[n]=g_ticket; g_pendT[n]=TimeCurrent();
+   g_ticket=0; g_dir=0; g_trailStage=-1; g_barsHeld=0; g_lastExitTime=TimeCurrent();
+  }
+void ProcessPending()
+  {
+   for(int i=ArraySize(g_pend)-1;i>=0;i--)
+     {
+      bool done=BuildCloseReport(g_pend[i]);
+      if(!done && (TimeCurrent()-g_pendT[i])>60){ LG("WARN",StringFormat("no close deal found for #%I64u after 60 s - not reported",g_pend[i])); done=true; }
+      if(done)
+        {
+         int n=ArraySize(g_pend);
+         for(int k=i+1;k<n;k++){ g_pend[k-1]=g_pend[k]; g_pendT[k-1]=g_pendT[k]; }
+         ArrayResize(g_pend,n-1); ArrayResize(g_pendT,n-1);
+        }
+     }
+  }
+
+// called from OnTimer so the trading logic is never blocked by the network
+void FlushQueue()
+  {
+   if(!SheetOn() || ArraySize(g_q)==0) return;
+   if(TimeLocal()<g_nextSend) return;
+   char data[],res[]; string rh;
+   int n=StringToCharArray(g_q[0],data,0,WHOLE_ARRAY,CP_UTF8);
+   if(n>0) ArrayResize(data,n-1);                 // drop the terminating zero
+   ResetLastError();
+   int code=WebRequest("POST",InpSheetURL,"Content-Type: application/json\r\n",InpWebTimeoutMs,data,res,rh);
+   if(code==200||code==201||code==302||code==303)
+     { QPop(); g_failCount=0; g_nextSend=0; return; }
+   g_failCount++;
+   int err=GetLastError();
+   if(g_failCount<=3 || g_failCount%20==0)
+     {
+      if(code==-1) LG("SHEET",StringFormat("WebRequest failed, error %d%s (will retry)",err,err==4060?" - add the URL under Tools > Options > Expert Advisors > Allow WebRequest":""));
+      else         LG("SHEET",StringFormat("server answered HTTP %d (will retry): %s",code,CharArrayToString(res,0,200,CP_UTF8)));
+     }
+   g_nextSend=TimeLocal()+(datetime)MathMin(60,5*g_failCount);
+  }
+
+//+------------------------------------------------------------------+
+//| Direction engine - called every tick                             |
+//+------------------------------------------------------------------+
+void UpdateDirection()
+  {
+   int sh=InpUseFormingBar?0:1;
+   double f=Buf(hTrF,sh),s=Buf(hTrS,sh);
+   if(f<=0||s<=0) return;
+   g_fast=f; g_slow=s;
+   g_e200=(hTr200!=INVALID_HANDLE)?Buf(hTr200,sh):0;
+
+   // hysteresis: inside the band the previous raw direction is kept
+   double band=InpFlipBandATR*atr,gap=f-s;
+   if(gap>band) g_rawDir=1; else if(gap<-band) g_rawDir=-1;
+
+   int cand=g_rawDir;
+   double mid=Mid();
+   if(InpMomentumConfirm && cand!=0 && cand!=g_confDir)
+      if((cand>0 && mid<=f)||(cand<0 && mid>=f)) cand=g_confDir;
+   if(InpTrendFilter==TFILT_STRICT && g_e200>0 && cand!=0)
+      if((cand>0 && mid<g_e200)||(cand<0 && mid>g_e200)) cand=0;
+
+   long now=NowMs();
+   if(cand==g_confDir){ g_pendDir=cand; g_pendTicks=0; g_pendSinceMs=now; return; }
+   if(cand!=g_pendDir){ g_pendDir=cand; g_pendTicks=1; g_pendSinceMs=now; }
+   else g_pendTicks++;
+
+   bool first=(g_confDir==0 && cand!=0);
+   if(first || ((now-g_pendSinceMs)>=InpFlipConfirmMs && g_pendTicks>=InpFlipConfirmTicks))
+     {
+      if(g_confDir!=0 && cand!=0) g_flips++;
+      LG("DIR",StringFormat("%s -> %s  (gap %.2f, band %.2f, %d ticks, %d ms)",DirStr(g_confDir),DirStr(cand),gap,band,g_pendTicks,(int)(now-g_pendSinceMs)));
+      g_confDir=cand; g_pendTicks=0;
+     }
+  }
+
+// direction allowed for a new position
+int EntryDirection(bool isReverse)
+  {
+   int d=g_confDir; if(d==0) return 0;
+   if(InpTrendFilter==TFILT_ENTRY_ONLY && g_e200>0)
+     { double mid=Mid(); if((d>0&&mid<g_e200)||(d<0&&mid>g_e200)){ g_note="entry blocked: against EMA"+IntegerToString(InpEMATrend); return 0; } }
+   if(!isReverse && InpEntrySepATR>0 && atr>0 && MathAbs(g_fast-g_slow)<InpEntrySepATR*atr){ g_note="EMAs too close for fresh entry"; return 0; }
+   return d;
+  }
+
+//+------------------------------------------------------------------+
+//| Order execution                                                  |
+//+------------------------------------------------------------------+
+bool SendMarket(int dir,double lots,double sl,double tp,double &fillPx,ulong &posTicket,string cmt)
+  {
+   fillPx=0; posTicket=0;
+   int fm=(int)SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING tries[3]={ORDER_FILLING_IOC,ORDER_FILLING_FOK,ORDER_FILLING_RETURN};
+   bool slDropped=false;
+   for(int a=0;a<3;a++)
+     {
+      if(tries[a]==ORDER_FILLING_IOC && (fm&SYMBOL_FILLING_IOC)==0) continue;
+      if(tries[a]==ORDER_FILLING_FOK && (fm&SYMBOL_FILLING_FOK)==0) continue;
+      Trade.SetTypeFilling(tries[a]);
+      Sym.RefreshRates();
+      double s=(sl>0)?Nrm(sl):0;
+      double t=(tp>0)?Nrm(tp):0;
+      bool ok=(dir>0)?Trade.Buy(lots,_Symbol,0,s,t,cmt):Trade.Sell(lots,_Symbol,0,s,t,cmt);
+      uint rc=Trade.ResultRetcode();
+      if(ok && (rc==TRADE_RETCODE_DONE||rc==TRADE_RETCODE_DONE_PARTIAL||rc==TRADE_RETCODE_PLACED))
+        {
+         fillPx=Trade.ResultPrice(); if(fillPx<=0) fillPx=(dir>0)?Sym.Ask():Sym.Bid();
+         ulong deal=Trade.ResultDeal();
+         if(deal>0 && HistoryDealSelect(deal)) posTicket=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+         if(posTicket==0) posTicket=Trade.ResultOrder();
+         return true;
+        }
+      LG("ERROR",StringFormat("send %s %.2f failed: %u %s",DirStr(dir),lots,rc,Trade.ResultRetcodeDescription()));
+      if(rc==TRADE_RETCODE_INVALID_STOPS && (sl>0||tp>0) && !slDropped){ sl=0; tp=0; slDropped=true; a--; continue; } // retry naked, SL/TP set after
+      if(rc!=TRADE_RETCODE_INVALID_FILL) return false;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Open the single position                                         |
+//+------------------------------------------------------------------+
+bool OpenTrade(int dir)
+  {
+   Sym.RefreshRates();
+   double spread=Sym.Ask()-Sym.Bid();
+   double slDist=MathMax(PipDist(InpSLPips),StopsDist()+spread);
+   double tpDist=PipDist(InpTPPips);
+   double lots=CalcLots();
+   if(!MarginOK(dir,lots)){ g_note="not enough free margin"; return false; }
+
+   double est=(dir>0)?Sym.Ask():Sym.Bid();
+   double fill; ulong tk;
+   if(!SendMarket(dir,lots,SafeSL(dir,est-dir*slDist),Nrm(est+dir*tpDist),fill,tk,"pyr1")) return false;
+
+   if(tk==0 || !PositionSelectByTicket(tk)){ if(FindMine()) tk=Pos.Ticket(); }
+   if(tk==0){ LG("ERROR","position opened but ticket not found"); return false; }
+
+   // align SL / TP exactly to the real fill price (also attaches them if the broker refused them on entry)
+   double wantSL=SafeSL(dir,fill-dir*slDist),wantTP=Nrm(fill+dir*tpDist);
+   if(PositionSelectByTicket(tk))
+     {
+      double cs=PositionGetDouble(POSITION_SL),ct=PositionGetDouble(POSITION_TP);
+      if(cs<=0||ct<=0||MathAbs(cs-wantSL)>_Point||MathAbs(ct-wantTP)>_Point)
+         if(!Trade.PositionModify(tk,wantSL,wantTP)) LG("WARN",StringFormat("could not set SL/TP on #%I64u: %s",tk,Trade.ResultRetcodeDescription()));
+     }
+
+   g_ticket=tk; g_dir=dir; g_barsHeld=0; g_trailStage=-1; g_dayTrades++;
+   LG("OPEN",StringFormat("%s %.2f @ %s SL %s TP %s (bal %.2f)",DirStr(dir),lots,DoubleToString(fill,_Digits),
+        DoubleToString(wantSL,_Digits),DoubleToString(wantTP,_Digits),Bal()));
+   QueueOpen(tk);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Staged trailing SL                                               |
+//|   prog = dir*(price-entry)/tpDist                                |
+//|   highest stage whose trigger <= prog decides the SL:            |
+//|   SL = entry + dir*lock*tpDist     (only ever moves forward)     |
+//+------------------------------------------------------------------+
+void ApplyTrail()
+  {
+   if(!InpUseTrail || !FindMine()) return;
+   int dir=(Pos.PositionType()==POSITION_TYPE_BUY)?1:-1;
+   double entry=Pos.PriceOpen(),sl=Pos.StopLoss(),tp=Pos.TakeProfit();
+   double tpDist=PipDist(InpTPPips);
+   if(tpDist<=0) return;
+   Sym.RefreshRates();
+   double px=(dir>0)?Sym.Bid():Sym.Ask();
+   double prog=dir*(px-entry)/tpDist;
+
+   int stage=-1;
+   for(int k=0;k<5;k++) if(prog>=g_trTrig[k]-1e-9) stage=k;
+   if(stage<0) return;
+
+   double lvl=Nrm(entry+dir*g_trLock[stage]*tpDist);
+   if(sl>0 && dir*(lvl-sl)<=_Point) { if(stage>g_trailStage) g_trailStage=stage; return; }   // never loosen / no change
+   double md=StopsDist();
+   bool placeable=(dir>0)?(lvl<=Sym.Bid()-md):(lvl>=Sym.Ask()+md);
+   if(!placeable) return;
+   if(Trade.PositionModify(Pos.Ticket(),lvl,tp))
+     {
+      if(stage>g_trailStage) g_trailStage=stage;
+      LG("TRAIL",StringFormat("#%I64u reached %.0f%% of TP -> SL to %.0f%% of TP (%s)",Pos.Ticket(),g_trTrig[stage]*100,g_trLock[stage]*100,DoubleToString(lvl,_Digits)));
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Gates / entries / management                                     |
+//+------------------------------------------------------------------+
+bool Gates(string &why)
+  {
+   datetime now=TimeCurrent();
+   if(DayStart(now)!=g_day){ g_day=DayStart(now); g_dayStartBalance=Bal(); g_dayPnL=0; g_dayTrades=0; g_dayStopped=false; }
+   if(g_dayStopped){ why="day stopped"; return false; }
+   if(InpMaxDailyLossPct>0 && g_dayStartBalance>0 && g_dayPnL<=-g_dayStartBalance*InpMaxDailyLossPct/100.0){ g_dayStopped=true; why="daily loss limit"; return false; }
+   if(InpDailyProfitLock>0 && g_dayPnL>=g_dayStartBalance*InpDailyProfitLock/100.0){ g_dayStopped=true; why="daily profit locked"; return false; }
+   if(InpMaxTradesPerDay>0 && g_dayTrades>=InpMaxTradesPerDay){ why="max trades today"; return false; }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)||!MQLInfoInteger(MQL_TRADE_ALLOWED)){ why="AutoTrading off"; return false; }
+   if(SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE)!=SYMBOL_TRADE_MODE_FULL){ why="market closed / restricted"; return false; }
+   if(InpMaxSpreadATR>0 && atr>0)
+     { Sym.RefreshRates(); if(Sym.Ask()-Sym.Bid()>InpMaxSpreadATR*atr){ why="spread too wide"; return false; } }
+   return true;
+  }
+
+bool OpenCampaign(int dir)
+  {
+   string why;
+   if(!Gates(why)){ g_note=why; g_blocked=true; return false; }
+   g_blocked=false;
+   return OpenTrade(dir);
+  }
+
+void TryEntry()
+  {
+   if(g_ticket!=0 || FindMine()) return;                 // one position at a time
+   if(InpReentryCooldownSec>0 && (TimeCurrent()-g_lastExitTime)<InpReentryCooldownSec){ g_note="re-entry cooldown"; return; }
+   int d=EntryDirection(false);
+   if(d==0){ if(g_confDir==0) g_note="no direction yet"; return; }
+   g_note="entering "+DirStr(d);
+   OpenCampaign(d);
+  }
+
+void ManageTrade()
+  {
+   if(!FindMine()) return;
+   int dir=(Pos.PositionType()==POSITION_TYPE_BUY)?1:-1;
+   g_dir=dir;
+   if(g_ticket==0) g_ticket=Pos.Ticket();
+
+   // flip with the market - stop and reverse on the same tick
+   if(InpFlipOnReverse && g_confDir!=0 && g_confDir!=dir)
+     {
+      int nd=g_confDir;
+      LG("FLIP",StringFormat("%s -> %s, closing position",DirStr(dir),DirStr(nd)));
+      Trade.PositionClose(Pos.Ticket(),InpDeviationPoints);
+      CheckClosed();                                      // parks the old ticket for the close report
+      if(InpStopAndReverse && !FindMine())
+        {
+         int d=EntryDirection(true);
+         if(d==nd){ g_note="reversed to "+DirStr(nd); OpenCampaign(nd); }
+        }
+     }
+  }
+
+void OnNewBar()
+  {
+   if(FindMine())
+     {
+      g_barsHeld++;
+      if(InpMaxHoldBars>0 && g_barsHeld>=InpMaxHoldBars && Pos.Profit()<0)
+        { LG("EXIT","time exit"); Trade.PositionClose(Pos.Ticket(),InpDeviationPoints); CheckClosed(); }
+      return;
+     }
+   if(!InpIntrabarEntry) TryEntry();
+  }
+
+// resume after a restart / recompile with the position still open
+void RecoverState()
+  {
+   if(!FindMine()) return;
+   g_ticket=Pos.Ticket();
+   g_dir=(Pos.PositionType()==POSITION_TYPE_BUY)?1:-1;
+   LG("RECOVER",StringFormat("resumed %s #%I64u %.2f lots",DirStr(g_dir),g_ticket,Pos.Volume()));
+  }
+
+//+------------------------------------------------------------------+
+//| Dashboard                                                        |
+//+------------------------------------------------------------------+
+void Lbl(string id,int x,int y,string txt,color clr)
+  {
+   string n="PYR_L_"+id;
+   if(ObjectFind(0,n)<0)
+     { ObjectCreate(0,n,OBJ_LABEL,0,0,0); ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false); ObjectSetString(0,n,OBJPROP_FONT,"Consolas"); }
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt); ObjectSetInteger(0,n,OBJPROP_COLOR,clr); ObjectSetInteger(0,n,OBJPROP_FONTSIZE,InpFontSize);
+  }
+void Dashboard()
+  {
+   if(!InpShowDashboard) return;
+   int lh=InpFontSize+6,x=12,y=24,i=0; color cH=clrWhite,cM=clrSilver,cG=clrLimeGreen,cR=clrTomato,cY=clrGold;
+   string n="PYR_PANEL";
+   if(ObjectFind(0,n)<0)
+     { ObjectCreate(0,n,OBJ_RECTANGLE_LABEL,0,0,0); ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,n,OBJPROP_BGCOLOR,C'16,20,28'); ObjectSetInteger(0,n,OBJPROP_BORDER_TYPE,BORDER_FLAT); ObjectSetInteger(0,n,OBJPROP_COLOR,clrDimGray); ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false); }
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,6); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,18); ObjectSetInteger(0,n,OBJPROP_XSIZE,470); ObjectSetInteger(0,n,OBJPROP_YSIZE,lh*9+12);
+   double bal=Bal();
+   Lbl("a",x,y+lh*i++,StringFormat("  %s SINGLE POSITION v5.00  SL %.0f / TP %.0f pips  24/7",_Symbol,InpSLPips,InpTPPips),cH);
+   Lbl("b",x,y+lh*i++,"---------------------------------------------------",cM);
+   Lbl("c",x,y+lh*i++,StringFormat("Bal %.2f | next lot %.2f (%s) | sheet %s q%d",bal,CalcLots(),(InTester()||InpFixedLotEverywhere)?"fixed":"balance-based",SheetOn()?"ON":"off",ArraySize(g_q)),cM);
+   Lbl("d",x,y+lh*i++,StringFormat("TREND %s  raw %s  gap %.2f band %.2f  flips %d",DirStr(g_confDir),DirStr(g_rawDir),g_fast-g_slow,InpFlipBandATR*atr,g_flips),g_confDir>0?cG:(g_confDir<0?cR:cY));
+   if(FindMine())
+     {
+      double p=Pos.Profit()+Pos.Swap()+Pos.Commission(); double tpD=PipDist(InpTPPips);
+      Sym.RefreshRates(); double px=(g_dir>0)?Sym.Bid():Sym.Ask();
+      double prog=(tpD>0)?g_dir*(px-Pos.PriceOpen())/tpD*100.0:0;
+      Lbl("e",x,y+lh*i++,StringFormat("IN %s %.2f lots  P/L %.2f  @ %.0f%% of TP",g_dir>0?"LONG":"SHORT",Pos.Volume(),p,prog),p>=0?cG:cR);
+      Lbl("f",x,y+lh*i++,StringFormat("entry %s  SL %s  TP %s  trail stage %d/5",DoubleToString(Pos.PriceOpen(),_Digits),DoubleToString(Pos.StopLoss(),_Digits),DoubleToString(Pos.TakeProfit(),_Digits),g_trailStage+1),cM);
+     }
+   else
+     {
+      Lbl("e",x,y+lh*i++,"FLAT",cM);
+      Lbl("f",x,y+lh*i++,"-",cM);
+     }
+   Lbl("g",x,y+lh*i++,StringFormat("Day %+.2f  trades %d %s",g_dayPnL,g_dayTrades,g_dayStopped?"STOPPED":""),g_dayPnL>=0?cG:cR);
+   int cl=g_nWins+g_nLosses;
+   Lbl("h",x,y+lh*i++,StringFormat("Session %d trades  win %.0f%%  PF %.2f",cl,cl>0?100.0*g_nWins/cl:0,g_grossLoss>0?g_grossWin/g_grossLoss:0),cH);
+   Lbl("i",x,y+lh*i++,(g_blocked?"BLOCKED: ":"Note: ")+g_note,g_blocked?cR:cY);
+   ChartRedraw(0);
+  }
+
+//+------------------------------------------------------------------+
+//| Events                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   Sym.Name(_Symbol);
+   Trade.SetExpertMagicNumber(InpMagic); Trade.SetDeviationInPoints(InpDeviationPoints); Trade.LogLevel(LOG_LEVEL_ERRORS);
+   hATR=iATR(_Symbol,InpTF,InpATRPeriod);
+   hTrF=iMA(_Symbol,InpTrendTF,InpTrendFast,0,MODE_EMA,PRICE_CLOSE);
+   hTrS=iMA(_Symbol,InpTrendTF,InpTrendSlow,0,MODE_EMA,PRICE_CLOSE);
+   if(InpTrendFilter!=TFILT_OFF && InpEMATrend>0) hTr200=iMA(_Symbol,InpTrendTF,InpEMATrend,0,MODE_EMA,PRICE_CLOSE);
+   if(hATR==INVALID_HANDLE||hTrF==INVALID_HANDLE||hTrS==INVALID_HANDLE){ LG("ERROR","indicator handle failed"); return INIT_FAILED; }
+   if(InpTrendFast>=InpTrendSlow){ LG("ERROR","InpTrendFast must be < InpTrendSlow"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpTPPips<=0||InpSLPips<=0||InpPointsPerPip<=0){ LG("ERROR","SL/TP pips and points-per-pip must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpBalancePerStep<=0||InpLotPerStep<=0||InpTesterLot<=0){ LG("ERROR","lot inputs must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+
+   // trail table
+   double tr[5]={InpTrail1Trigger,InpTrail2Trigger,InpTrail3Trigger,InpTrail4Trigger,InpTrail5Trigger};
+   double lk[5]={InpTrail1Lock,InpTrail2Lock,InpTrail3Lock,InpTrail4Lock,InpTrail5Lock};
+   for(int k=0;k<5;k++)
+     {
+      g_trTrig[k]=tr[k]/100.0; g_trLock[k]=lk[k]/100.0;
+      if(tr[k]<=0||tr[k]>=100||lk[k]<0||lk[k]>=tr[k]||(k>0 && (tr[k]<=tr[k-1]||lk[k]<lk[k-1])))
+        { LG("ERROR",StringFormat("trail stage %d invalid: triggers must increase, locks must not decrease and stay below their trigger",k+1)); return INIT_PARAMETERS_INCORRECT; }
+     }
+
+   g_day=DayStart(TimeCurrent()); g_dayStartBalance=Bal();
+   atr=Buf(hATR,1);
+   RecoverState();
+
+   LG("INFO",StringFormat("v5.00 on %s | bal %.2f | SL %.0f / TP %.0f pips (%.2f / %.2f price) | lot now %.2f (%s) | TRAIL %s",
+        _Symbol,Bal(),InpSLPips,InpTPPips,PipDist(InpSLPips),PipDist(InpTPPips),CalcLots(),(InTester()||InpFixedLotEverywhere)?"fixed":"balance-based",InpUseTrail?"ON":"OFF"));
+   LG("INFO",StringFormat("TRAIL: 20%%->1%% | 50%%->20%% | 70%%->50%% | 80%%->60%% | 90%%->80%% (inputs: %.0f>%.0f %.0f>%.0f %.0f>%.0f %.0f>%.0f %.0f>%.0f)",
+        tr[0],lk[0],tr[1],lk[1],tr[2],lk[2],tr[3],lk[3],tr[4],lk[4]));
+   if(SheetOn())
+     {
+      hR_E9 =iMA(_Symbol,InpRptTF,RPT_EMA_FAST,0,MODE_EMA,PRICE_CLOSE);
+      hR_E20=iMA(_Symbol,InpRptTF,RPT_EMA_SLOW,0,MODE_EMA,PRICE_CLOSE);
+      hR_S9 =iMA(_Symbol,InpRptTF,RPT_SMA,0,MODE_SMA,PRICE_CLOSE);
+      hR_ADX=iADX(_Symbol,InpRptTF,InpRptADXPeriod);
+      hR_ATR=iATR(_Symbol,InpRptTF,InpRptATRPeriod);
+      hR_BB =iBands(_Symbol,InpRptTF,InpRptBBPeriod,0,InpRptBBDev,PRICE_CLOSE);
+      if(hR_E9==INVALID_HANDLE||hR_E20==INVALID_HANDLE||hR_S9==INVALID_HANDLE||hR_ADX==INVALID_HANDLE||hR_ATR==INVALID_HANDLE||hR_BB==INVALID_HANDLE)
+         LG("WARN","report indicator handle failed - indicator columns will be 0");
+     }
+   if(!InTester() && InpSheetEnabled)
+     {
+      if(StringLen(InpSheetURL)<=10) LG("WARN","Google Sheet reporting is ON but InpSheetURL is empty - nothing will be sent");
+      else LG("INFO","Google Sheet reporting ON. Make sure the URL is listed in Tools > Options > Expert Advisors > Allow WebRequest for listed URL (add https://script.google.com and https://script.googleusercontent.com)");
+     }
+   EventSetTimer(1);
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   if(hATR!=INVALID_HANDLE) IndicatorRelease(hATR);
+   if(hTrF!=INVALID_HANDLE) IndicatorRelease(hTrF);
+   if(hTrS!=INVALID_HANDLE) IndicatorRelease(hTrS);
+   if(hTr200!=INVALID_HANDLE) IndicatorRelease(hTr200);
+   int rh[6]={hR_E9,hR_E20,hR_S9,hR_ADX,hR_ATR,hR_BB};
+   for(int k=0;k<6;k++) if(rh[k]!=INVALID_HANDLE) IndicatorRelease(rh[k]);
+   if(reason!=REASON_CHARTCHANGE && reason!=REASON_PARAMETERS) ObjectsDeleteAll(0,"PYR_");
+  }
+
+void OnTick()
+  {
+   atr=Buf(hATR,1);
+   if(atr<=0) return;
+   UpdateDirection();                          // every tick
+   CheckClosed();                              // SL / TP / manual close detection
+   ProcessPending();                           // close reports waiting for deal history
+   if(FindMine()){ ApplyTrail(); ManageTrade(); }
+   else if(InpIntrabarEntry) TryEntry();
+   datetime bt=iTime(_Symbol,InpTF,0);
+   if(bt!=g_lastBar && bt!=0){ g_lastBar=bt; OnNewBar(); if(InTester()) Dashboard(); }
+  }
+
+void OnTimer()
+  {
+   if(InTester()) return;
+   CheckClosed();                              // also catches closes while no ticks arrive
+   ProcessPending();
+   FlushQueue();
+   Dashboard();
+  }
+
+double OnTester()
+  {
+   int cl=g_nWins+g_nLosses;
+   Print(StringFormat("===== v5.00: %d trades  win %.1f%%  PF %.2f  net %.2f  flips %d =====",
+        cl,cl>0?100.0*g_nWins/cl:0,g_grossLoss>0?g_grossWin/g_grossLoss:0,g_grossWin-g_grossLoss,g_flips));
+   double pf=TesterStatistics(STAT_PROFIT_FACTOR),tr=TesterStatistics(STAT_TRADES),dd=TesterStatistics(STAT_EQUITY_DDREL_PERCENT);
+   if(tr<30) return 0;
+   return MathMin(pf,3.0)*MathSqrt(MathMin(tr,300.0))-dd/5.0;
+  }
+//+------------------------------------------------------------------+
